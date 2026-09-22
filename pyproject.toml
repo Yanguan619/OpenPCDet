@@ -1,0 +1,49 @@
+[project]
+name = "openpcdet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Yanguan619", email = "1131595527@qq.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "absl-py>=2.5.0",
+    "attrs>=26.1.0",
+    "av2>=0.3.6",
+    "cffi>=2.1.1",
+    "cython>=3.2.9",
+    "decorator>=5.3.1",
+    "easydict>=1.13",
+    "numpy==1.26.4",
+    "onnx==1.16.1",
+    "opencv-python-headless>=4.11.0.86",
+    "pandas>=2.3.3",
+    "pathlib2>=2.3.7.post1",
+    "pillow>=12.3.0",
+    "protobuf==3.20.2",
+    "psutil>=7.2.2",
+    "pyarrow>=25.0.1",
+    "pybind11>=3.1.0",
+    "pyquaternion>=0.9.9",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
+    "sharedarray>=3.2.4",
+    "sympy>=1.14.0",
+    "torch-npu==2.7.1",
+    "torchvision==0.22.1",
+    "tqdm>=4.70.0",
+    "upath>=1.0",
+]
+
+[project.scripts]
+openpcdet = "openpcdet:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+index-url = "https://pypi.mirrors.ustc.edu.cn/simple/"

@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 from torch.autograd import Function, Variable
 
-from . import pointnet2_stack_cuda as pointnet2
+try:
+    from . import pointnet2_stack_cuda as pointnet2
+    POINTNET2_CUDA_ENABLED = True
+except ImportError:
+    pointnet2 = None
+    POINTNET2_CUDA_ENABLED = False
 
 
 class BallQuery(Function):
@@ -451,6 +456,21 @@ class VectorPoolWithVoxelQuery(Function):
 
 
 vector_pool_with_voxel_query_op = VectorPoolWithVoxelQuery.apply
+
+
+if not POINTNET2_CUDA_ENABLED:
+    # Torch-native fallback (no compiled CUDA extension required).
+    from . import pointnet2_utils_native
+
+    ball_query = pointnet2_utils_native.ball_query
+    grouping_operation = pointnet2_utils_native.grouping_operation
+    farthest_point_sample = pointnet2_utils_native.farthest_point_sample
+    stack_farthest_point_sample = pointnet2_utils_native.stack_farthest_point_sample
+    three_nn = pointnet2_utils_native.three_nn
+    three_interpolate = pointnet2_utils_native.three_interpolate
+    three_nn_for_vector_pool_by_two_step = pointnet2_utils_native.three_nn_for_vector_pool_by_two_step
+    vector_pool_with_voxel_query_op = pointnet2_utils_native.vector_pool_with_voxel_query_op
+    QueryAndGroup = pointnet2_utils_native.QueryAndGroup
 
 
 if __name__ == '__main__':

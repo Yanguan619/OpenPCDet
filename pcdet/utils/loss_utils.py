@@ -95,7 +95,7 @@ class WeightedSmoothL1Loss(nn.Module):
         self.beta = beta
         if code_weights is not None:
             self.code_weights = np.array(code_weights, dtype=np.float32)
-            self.code_weights = torch.from_numpy(self.code_weights).cuda()
+            self.code_weights = torch.from_numpy(self.code_weights)
 
     @staticmethod
     def smooth_l1_loss(diff, beta):
@@ -565,7 +565,7 @@ class IouRegLossSparse(nn.Module):
 class L1Loss(nn.Module):
     def __init__(self):
         super(L1Loss, self).__init__()
-       
+
     def forward(self, pred, target):
         if target.numel() == 0:
             return pred.sum() * 0

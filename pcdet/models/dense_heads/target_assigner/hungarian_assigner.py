@@ -1,6 +1,11 @@
 import torch
 from scipy.optimize import linear_sum_assignment
-from pcdet.ops.iou3d_nms import iou3d_nms_cuda
+try:
+    from pcdet.ops.iou3d_nms import iou3d_nms_cuda
+    IOU3D_NMS_CUDA_ENABLED = True
+except ImportError:
+    from pcdet.ops.iou3d_nms import iou3d_nms_torch_native as iou3d_nms_native
+    IOU3D_NMS_CUDA_ENABLED = False
 
 
 def height_overlaps(boxes1, boxes2):
@@ -33,12 +38,17 @@ def overlaps(boxes1, boxes2):
     boxes2_bev = boxes2[:,:7]
 
     # bev overlap
-    overlaps_bev = boxes1_bev.new_zeros(
-        (boxes1_bev.shape[0], boxes2_bev.shape[0])
-    ).cuda()  # (N, M)
-    iou3d_nms_cuda.boxes_overlap_bev_gpu(
-        boxes1_bev.contiguous().cuda(), boxes2_bev.contiguous().cuda(), overlaps_bev
-    )
+    if IOU3D_NMS_CUDA_ENABLED:
+        overlaps_bev = boxes1_bev.new_zeros(
+            (boxes1_bev.shape[0], boxes2_bev.shape[0])
+        ).cuda()  # (N, M)
+        iou3d_nms_cuda.boxes_overlap_bev_gpu(
+            boxes1_bev.contiguous().cuda(), boxes2_bev.contiguous().cuda(), overlaps_bev
+        )
+    else:
+        overlaps_bev = iou3d_nms_native.box_overlap_bev(
+            boxes1_bev.contiguous(), boxes2_bev.contiguous()
+        ).to(boxes1.device)
 
     # 3d overlaps
     overlaps_3d = overlaps_bev.to(boxes1.device) * overlaps_h

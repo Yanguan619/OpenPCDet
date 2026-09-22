@@ -1,6 +1,11 @@
 import torch
 
-from . import bev_pool_ext
+try:
+    from . import bev_pool_ext
+    BEV_POOL_CUDA_ENABLED = True
+except ImportError:
+    bev_pool_ext = None
+    BEV_POOL_CUDA_ENABLED = False
 
 __all__ = ["bev_pool"]
 
@@ -80,6 +85,29 @@ class QuickCumsumCuda(torch.autograd.Function):
         return x_grad, None, None, None, None, None, None
 
 
+def bev_pool_native(feats, coords, ranks, B, D, H, W):
+    """Torch-native implementation of the BEV pooling.
+
+    Both ``feats`` and ``coords`` are assumed to be already sorted by ``ranks``,
+    so that points mapping to the same BEV position appear consecutively.
+    """
+    x, geom_feats = QuickCumsum.apply(feats, coords, ranks)  # (num_unique, C), (num_unique, 4)
+
+    # scatter the per-position sums into a dense volume whose layout is
+    # coords = [x, y, z, batch]  ->  out[batch, z, y, x, channel]
+    batch_ix = geom_feats[:, 3]
+    z_ix = geom_feats[:, 2]
+    y_ix = geom_feats[:, 1]
+    x_ix = geom_feats[:, 0]
+    flat_ix = batch_ix * (D * H * W) + z_ix * (H * W) + y_ix * W + x_ix
+
+    out = feats.new_zeros((B * D * H * W, feats.shape[1]))
+    out[flat_ix.long()] = x  # differentiable scatter
+    out = out.view(B, D, H, W, feats.shape[1])
+    out = out.permute(0, 4, 1, 2, 3).contiguous()
+    return out
+
+
 def bev_pool(feats, coords, B, D, H, W):
     assert feats.shape[0] == coords.shape[0]
 
@@ -92,6 +120,10 @@ def bev_pool(feats, coords, B, D, H, W):
     indices = ranks.argsort()
     feats, coords, ranks = feats[indices], coords[indices], ranks[indices]
 
-    x = QuickCumsumCuda.apply(feats, coords, ranks, B, D, H, W)
-    x = x.permute(0, 4, 1, 2, 3).contiguous()
-    return x
+    if BEV_POOL_CUDA_ENABLED:
+        x = QuickCumsumCuda.apply(feats, coords, ranks, B, D, H, W)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
+    else:
+        x = bev_pool_native(feats, coords, ranks, B, D, H, W)
+        return x

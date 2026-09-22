@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.autograd import Function
 
 from ...utils import common_utils
-from . import roiaware_pool3d_cuda
+from . import roiaware_pool3d_torch_native as roiaware_pool3d_cuda
 
 
 def points_in_boxes_cpu(points, boxes):
@@ -19,8 +19,9 @@ def points_in_boxes_cpu(points, boxes):
     points, is_numpy = common_utils.check_numpy_to_torch(points)
     boxes, is_numpy = common_utils.check_numpy_to_torch(boxes)
 
-    point_indices = points.new_zeros((boxes.shape[0], points.shape[0]), dtype=torch.int)
-    roiaware_pool3d_cuda.points_in_boxes_cpu(boxes.float().contiguous(), points.float().contiguous(), point_indices)
+    point_indices = roiaware_pool3d_cuda.points_in_boxes_cpu(
+        points.float().contiguous(), boxes.float().contiguous()
+    )
 
     return point_indices.numpy() if is_numpy else point_indices
 
@@ -35,8 +36,9 @@ def points_in_boxes_gpu(points, boxes):
     assert boxes.shape[2] == 7 and points.shape[2] == 3
     batch_size, num_points, _ = points.shape
 
-    box_idxs_of_pts = points.new_zeros((batch_size, num_points), dtype=torch.int).fill_(-1)
-    roiaware_pool3d_cuda.points_in_boxes_gpu(boxes.contiguous(), points.contiguous(), box_idxs_of_pts)
+    box_idxs_of_pts = roiaware_pool3d_cuda.points_in_boxes_gpu(
+        points.contiguous(), boxes.contiguous()
+    )
 
     return box_idxs_of_pts
 

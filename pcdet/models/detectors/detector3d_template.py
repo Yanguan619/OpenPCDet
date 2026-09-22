@@ -264,9 +264,17 @@ class Detector3DTemplate(nn.Module):
                     max_cls_preds, _ = torch.max(src_cls_preds, dim=-1)
                     selected_scores = max_cls_preds[selected]
 
-                final_scores = selected_scores
-                final_labels = label_preds[selected]
-                final_boxes = box_preds[selected]
+                # class_agnostic_nms 对 NPU 输入返回 CPU 索引；此处索引 label/box 也放到
+                # CPU 完成（规避 aicpu GatherElements 崩溃），结果搬回设备。
+                if selected.device.type != 'cpu':
+                    final_scores = selected_scores
+                    final_labels = label_preds[selected]
+                    final_boxes = box_preds[selected]
+                else:
+                    out_device = label_preds.device
+                    final_scores = selected_scores.to(out_device)
+                    final_labels = label_preds.detach().cpu()[selected].to(out_device)
+                    final_boxes = box_preds.detach().cpu()[selected].to(out_device)
                     
             recall_dict = self.generate_recall_record(
                 box_preds=final_boxes if 'rois' not in batch_dict else src_box_preds,
@@ -290,6 +298,14 @@ class Detector3DTemplate(nn.Module):
 
         rois = data_dict['rois'][batch_index] if 'rois' in data_dict else None
         gt_boxes = data_dict['gt_boxes'][batch_index]
+
+        # NPU 310P 的 aicpu GatherElements 对不规则索引不稳定，而 recall 计算只产出
+        # 标量指标，对 demo 无意义；整体放到 CPU 完成，规避设备端 IoU 崩溃。
+        if box_preds.device.type != 'cpu':
+            box_preds = box_preds.detach().cpu()
+            gt_boxes = gt_boxes.detach().cpu()
+            if rois is not None:
+                rois = rois.detach().cpu()
 
         if recall_dict.__len__() == 0:
             recall_dict = {'gt': 0}

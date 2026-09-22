@@ -3,7 +3,72 @@ import torch.nn as nn
 from torch.autograd import Function
 
 from ...utils import box_utils
-from . import roipoint_pool3d_cuda
+
+try:
+    from . import roipoint_pool3d_cuda
+    ROIPOOL3D_CUDA_ENABLED = True
+except ImportError:
+    roipoint_pool3d_cuda = None
+    ROIPOOL3D_CUDA_ENABLED = False
+
+
+def roipoint_pool3d_native(points, pooled_boxes3d, point_features, pooled_features, pooled_empty_flag):
+    """
+    Torch-native implementation of the ROI-point pooling kernel.
+
+    Args:
+        points: (B, N, 3)
+        pooled_boxes3d: (B, M, 7) enlarged boxes [x, y, z, dx, dy, dz, heading]
+        point_features: (B, N, C)
+        pooled_features: (B, M, num_sampled_points, 3 + C) pre-allocated output
+        pooled_empty_flag: (B, M) pre-allocated int output (1 if a box has no point)
+    """
+    batch_size, pts_num, _ = points.shape
+    boxes_num, sampled_pts_num, feature_len = pooled_features.shape[1], pooled_features.shape[2], point_features.shape[2]
+    if pts_num == 0 or boxes_num == 0:
+        return
+
+    S = sampled_pts_num
+    MARGIN = 1e-5
+
+    for b in range(batch_size):
+        pts = points[b]                 # (N, 3)
+        feats = point_features[b]       # (N, C)
+        boxes = pooled_boxes3d[b]       # (M, 7)
+        if points.shape[0] == 0:
+            pooled_empty_flag[b] = 1
+            continue
+
+        cx, cy, cz = boxes[:, 0], boxes[:, 1], boxes[:, 2]
+        dx, dy, dz = boxes[:, 3], boxes[:, 4], boxes[:, 5]
+        rz = boxes[:, 6]
+
+        shift = pts[None, :, :] - boxes[:, None, :3]                    # (M, N, 3)
+        cosa = torch.cos(-rz)
+        sina = torch.sin(-rz)
+        local_x = shift[..., 0] * cosa[:, None] - shift[..., 1] * sina[:, None]
+        local_y = shift[..., 0] * sina[:, None] + shift[..., 1] * cosa[:, None]
+        local_z = shift[..., 2]
+
+        in_x = local_x.abs() < (dx[:, None] / 2.0 + MARGIN)
+        in_y = local_y.abs() < (dy[:, None] / 2.0 + MARGIN)
+        in_z = local_z.abs() <= (dz[:, None] / 2.0)
+        mask = in_x & in_y & in_z                                        # (M, N)
+
+        for m in range(boxes_num):
+            in_pts = torch.nonzero(mask[m]).flatten()                    # (num_in,)
+            cnt = in_pts.numel()
+            if cnt == 0:
+                pooled_empty_flag[b, m] = 1
+                continue
+            if cnt >= S:
+                idx = in_pts[:S]
+            else:
+                # duplicate the same points for sampling like the cuda kernel
+                pad = in_pts[torch.arange(S - cnt, device=in_pts.device) % cnt]
+                idx = torch.cat([in_pts, pad])
+            pooled_features[b, m, :, :3] = pts[idx]
+            pooled_features[b, m, :, 3:] = feats[idx]
 
 
 class RoIPointPool3d(nn.Module):
@@ -51,10 +116,15 @@ class RoIPointPool3dFunction(Function):
         pooled_features = point_features.new_zeros((batch_size, boxes_num, num_sampled_points, 3 + feature_len))
         pooled_empty_flag = point_features.new_zeros((batch_size, boxes_num)).int()
 
-        roipoint_pool3d_cuda.forward(
-            points.contiguous(), pooled_boxes3d.contiguous(),
-            point_features.contiguous(), pooled_features, pooled_empty_flag
-        )
+        if ROIPOOL3D_CUDA_ENABLED:
+            roipoint_pool3d_cuda.forward(
+                points.contiguous(), pooled_boxes3d.contiguous(),
+                point_features.contiguous(), pooled_features, pooled_empty_flag
+            )
+        else:
+            roipoint_pool3d_native(
+                points, pooled_boxes3d, point_features, pooled_features, pooled_empty_flag
+            )
 
         return pooled_features, pooled_empty_flag
 

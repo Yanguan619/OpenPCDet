@@ -4,7 +4,12 @@ import torch
 import torch.nn as nn
 from torch.autograd import Function, Variable
 
-from . import pointnet2_batch_cuda as pointnet2
+try:
+    from . import pointnet2_batch_cuda as pointnet2
+    POINTNET2_BATCH_CUDA_ENABLED = True
+except ImportError:
+    pointnet2 = None
+    POINTNET2_BATCH_CUDA_ENABLED = False
 
 
 class FarthestPointSampling(Function):
@@ -288,3 +293,15 @@ class GroupAll(nn.Module):
             new_features = grouped_xyz
 
         return new_features
+
+
+if not POINTNET2_BATCH_CUDA_ENABLED:
+    # Torch-native fallback (no compiled CUDA extension required).
+    from . import pointnet2_batch_native
+
+    farthest_point_sample = pointnet2_batch_native.farthest_point_sample
+    gather_operation = pointnet2_batch_native.gather_operation
+    three_nn = pointnet2_batch_native.three_nn
+    three_interpolate = pointnet2_batch_native.three_interpolate
+    grouping_operation = pointnet2_batch_native.grouping_operation
+    ball_query = pointnet2_batch_native.ball_query

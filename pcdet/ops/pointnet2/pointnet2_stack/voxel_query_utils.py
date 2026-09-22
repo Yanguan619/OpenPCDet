@@ -4,8 +4,16 @@ from torch.autograd import Function
 import torch.nn as nn
 from typing import List
 
-from . import pointnet2_stack_cuda as pointnet2
+try:
+    from . import pointnet2_stack_cuda as pointnet2
+    VOXEL_QUERY_CUDA_ENABLED = True
+except ImportError:
+    pointnet2 = None
+    VOXEL_QUERY_CUDA_ENABLED = False
 from . import pointnet2_utils
+
+if not VOXEL_QUERY_CUDA_ENABLED:
+    from . import pointnet2_utils_native
 
 class VoxelQuery(Function):
 
@@ -30,11 +38,16 @@ class VoxelQuery(Function):
 
         M = new_coords.shape[0]
         B, Z, Y, X = point_indices.shape
-        idx = torch.cuda.IntTensor(M, nsample).zero_()
+        idx = torch.zeros(M, nsample, dtype=torch.int32, device=new_xyz.device)
 
-        z_range, y_range, x_range = max_range
-        pointnet2.voxel_query_wrapper(M, Z, Y, X, nsample, radius, z_range, y_range, x_range, \
-                    new_xyz, xyz, new_coords, point_indices, idx)
+        if VOXEL_QUERY_CUDA_ENABLED:
+            z_range, y_range, x_range = max_range
+            pointnet2.voxel_query_wrapper(M, Z, Y, X, nsample, radius, z_range, y_range, x_range, \
+                        new_xyz, xyz, new_coords, point_indices, idx)
+        else:
+            idx, _ = pointnet2_utils_native.voxel_query(
+                max_range, radius, nsample, xyz, new_xyz, new_coords, point_indices
+            )
 
         empty_ball_mask = (idx[:, 0] == -1)
         idx[empty_ball_mask] = 0

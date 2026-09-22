@@ -5,6 +5,16 @@ from ...ops.iou3d_nms import iou3d_nms_utils
 
 def class_agnostic_nms(box_scores, box_preds, nms_config, score_thresh=None):
     src_box_scores = box_scores
+
+    # NPU 310P 的 aicpu 对布尔掩码索引、index_select、topk、nonzero 等均不稳定
+    # （errorCode 0x2a），因此当输入在设备上时，整个 NMS 流程放到 CPU 完成，
+    # 返回 CPU 索引（调用方自行按需搬回设备）。
+    device = box_scores.device
+    if device.type != 'cpu':
+        box_scores = box_scores.detach().cpu()
+        box_preds = box_preds.detach().cpu()
+        src_box_scores = box_scores
+
     if score_thresh is not None:
         scores_mask = (box_scores >= score_thresh)
         box_scores = box_scores[scores_mask]
@@ -20,7 +30,7 @@ def class_agnostic_nms(box_scores, box_preds, nms_config, score_thresh=None):
         selected = indices[keep_idx[:nms_config.NMS_POST_MAXSIZE]]
 
     if score_thresh is not None:
-        original_idxs = scores_mask.nonzero().view(-1)
+        original_idxs = scores_mask.nonzero().reshape(-1)
         selected = original_idxs[selected]
     return selected, src_box_scores[selected]
 

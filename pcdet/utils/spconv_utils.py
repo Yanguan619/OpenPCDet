@@ -1,13 +1,16 @@
 from typing import Set
 
-import spconv
+# import spconv
+import unum_ops.spconv as spconv
 if float(spconv.__version__[2:]) >= 2.2:
     spconv.constants.SPCONV_USE_DIRECT_TABLE = False
-    
+
 try:
     import spconv.pytorch as spconv
 except:
-    import spconv as spconv
+    # import spconv as spconv
+    import unum_ops.spconv as spconv
+
 
 import torch.nn as nn
 

@@ -15,3 +15,16 @@ venv/
 *.bin
 output
 version.py
+*.onnx
+# Ascend
+*.om
+**/kernel_meta
+# 运行产物与本地缓存
+preds_*/
+.opencode/
+.python-version
+fusion_result.json
+ge_check_op.json
+spconv
+# 豁免（保留脚本）
+!npu/verify_npu.sh
