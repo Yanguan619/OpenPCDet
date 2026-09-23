@@ -37,7 +37,6 @@ from aclruntime import InferenceSession
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import DatasetTemplate
-from pcdet.models.model_utils import model_nms_utils
 from pcdet.utils import common_utils
 NUM_ANCHORS = 321408  # 216 * 248 * 2(rot) * 3(class)
 
@@ -148,10 +147,66 @@ def pad_to_static_m(voxels, voxel_num_points, voxel_coords, m_target):
     return voxels, voxel_num_points, voxel_coords, index_map
 
 
-def tensor_to_numpy(t, dtype):
-    """aclruntime.Tensor -> numpy（先 to_host 搬到 host 内存）。"""
+def tensor_to_numpy(t, dtype, copy=True):
+    """aclruntime.Tensor -> numpy（先 to_host 搬到 host 内存）。
+
+    copy=False 时返回 aclruntime host 缓冲的直接视图（writable，可喂 torch），
+    省去整块 memcpy；调用方须在下次 session.run 前消费完（后处理路径满足）。
+    """
     t.to_host()
-    return np.frombuffer(memoryview(t), dtype=dtype).reshape(t.shape).copy()
+    arr = np.frombuffer(memoryview(t), dtype=dtype).reshape(t.shape)
+    return arr.copy() if copy else arr
+
+
+def nms_topk_numpy(boxes, scores, score_thresh, nms_config):
+    """numpy 版 top-K 预筛 + 增量贪心旋转 NMS（与 class_agnostic_nms 同结果，避开 torch 小算子开销）。
+
+    NPU 310P 的 aicpu 对 topk/nonzero 等不稳定（见 model_nms_utils.py 注释），因此 top-K
+    筛选放到 host 侧 numpy 完成：
+      - score_thresh 掩码（>=，与 class_agnostic_nms 一致）
+      - 超出 NMS_PRE_MAXSIZE 时用 np.argpartition（O(N) 选 top-K，与 torch.topk 同集合，
+        并列分数次序差异允许）+ np.argsort 对 top-K 排序
+    NMS 直接复用 npu/ops_native/iou3d_nms_torch_native.py 的 numba 增量贪心 _nms_incremental
+    （要求输入已按 score 降序）；numba 不可用时回退 class_agnostic_nms。
+
+    Args:
+        boxes: (N, 7) float32 numpy，anchor 回归框（原始顺序）
+        scores: (N,) torch CPU，sigmoid 后单类分数
+        score_thresh: float 或 None
+        nms_config: NMS_PRE_MAXSIZE / NMS_POST_MAXSIZE / NMS_THRESH
+    Returns:
+        sel_idx: numpy int64，原始下标（score 降序）
+        sel_scores: numpy float32，对应分数
+    """
+    pre_max = int(getattr(nms_config, "NMS_PRE_MAXSIZE", 4096))
+    post_max = int(getattr(nms_config, "NMS_POST_MAXSIZE", 500))
+    thresh = float(getattr(nms_config, "NMS_THRESH", 0.01))
+    snp = scores.numpy()
+    if score_thresh is not None:
+        keep = np.nonzero(snp >= score_thresh)[0]
+    else:
+        keep = np.arange(snp.shape[0])
+    if keep.size > pre_max:
+        part = np.argpartition(snp[keep], keep.size - pre_max)
+        keep = keep[part[keep.size - pre_max:]]
+    order = np.argsort(-snp[keep])
+    keep = keep[order]
+    try:
+        from npu.ops_native.iou3d_nms_torch_native import _nms_incremental
+    except ImportError:
+        from pcdet.models.model_utils import model_nms_utils
+        selected, sub_scores = model_nms_utils.class_agnostic_nms(
+            box_scores=torch.from_numpy(snp[keep]),
+            box_preds=torch.from_numpy(boxes[keep]),
+            nms_config=nms_config,
+            score_thresh=None,
+        )
+        orig = keep[selected.numpy()]
+        return orig, sub_scores.numpy()
+    boxes_nms = np.ascontiguousarray(boxes[keep][:, :7])
+    kept = _nms_incremental(boxes_nms, thresh)[:post_max]
+    orig = keep[kept]
+    return orig, snp[orig]
 
 
 def load_kitti_labels(label_path, calib=None):
@@ -430,21 +485,15 @@ def main():
         print('OM inference time: {:.4f}s'.format(time.time() - time_start))
 
         if base_mode:
-            om_box = tensor_to_numpy(out[0], np.float32).reshape(1, NUM_ANCHORS, 7)
-            om_cls = tensor_to_numpy(out[1], np.float32).reshape(1, NUM_ANCHORS, 3)
-            # sigmoid/argmax 走 torch（CPU 向量化；numpy np.exp 在无有效 BLAS 的机器上 ~42ms，回归）
-            cls = torch.sigmoid(torch.from_numpy(om_cls[0]))
-            cls, label = torch.max(cls, dim=-1)
+            om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, NUM_ANCHORS, 7)
+            om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, NUM_ANCHORS, 3)
+            # sigmoid 单调递增：max(sigmoid(x)) == sigmoid(max(x))，先取类间 max 再 sigmoid（省 2/3 逐元素）
+            cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
             label = label + 1
-            selected, scores = model_nms_utils.class_agnostic_nms(
-                box_scores=cls.reshape(-1),
-                box_preds=torch.from_numpy(om_box[0]),
-                nms_config=nms_config,
-                score_thresh=score_thresh,
-            )
-            boxes = om_box[0][selected.numpy()]
+            scores = torch.sigmoid(cls_max)
+            selected, scores = nms_topk_numpy(om_box[0], scores, score_thresh, nms_config)
+            boxes = om_box[0][selected]
             labels = label[selected].numpy()
-            scores = scores.numpy()
         else:
             # 内嵌 NMS 的 OM：输出 nms_final_boxes/scores/labels/count
             boxes = tensor_to_numpy(out[0], np.float32).reshape(-1, 7)

@@ -33,7 +33,6 @@ import torch
 from aclruntime import InferenceSession
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import KittiDataset
-from pcdet.models.model_utils import model_nms_utils
 from pcdet.utils import common_utils, box_utils
 
 from npu.om_ref_demo import (
@@ -42,6 +41,7 @@ from npu.om_ref_demo import (
     pad_to_static_m,
     fov_filter_fused,
     tensor_to_numpy,
+    nms_topk_numpy,
     load_kitti_labels,
 )
 
@@ -290,20 +290,14 @@ def main():
 
         # ---------------- 后处理 ----------------
         t_c = time.perf_counter()
-        om_box = tensor_to_numpy(out[0], np.float32).reshape(1, NUM_ANCHORS, 7)
-        om_cls = tensor_to_numpy(out[1], np.float32).reshape(1, NUM_ANCHORS, 3)
-        cls = torch.sigmoid(torch.from_numpy(om_cls[0]))
-        cls, label = torch.max(cls, dim=-1)
+        om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, NUM_ANCHORS, 7)
+        om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, NUM_ANCHORS, 3)
+        cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
         label = label + 1
-        selected, scores = model_nms_utils.class_agnostic_nms(
-            box_scores=cls.reshape(-1),
-            box_preds=torch.from_numpy(om_box[0]),
-            nms_config=nms_config,
-            score_thresh=score_thresh,
-        )
-        boxes = om_box[0][selected.numpy()]
+        scores = torch.sigmoid(cls_max)
+        selected, scores = nms_topk_numpy(om_box[0], scores, score_thresh, nms_config)
+        boxes = om_box[0][selected]
         labels = label[selected].numpy()
-        scores = scores.numpy()
         t_post += time.perf_counter() - t_c
         preds_by_frame[fid] = (boxes, labels, scores)
 
