@@ -1,7 +1,6 @@
-"""直接用 PyTorch 导出 PointPillars + 后处理(sigmoid + topk + NMS)，不用图手术。
+"""合并导出: PPWrapper + 后处理(sigmoid/ReduceMax/topk/Gather)，没有 NMS。
 
-用法:
-    python npu/export_full.py [--opset 16]
+输出: boxes(1,M,7), scores(M), labels(M) — 保留所有 anchor, NMS 在 Python 侧做。
 """
 
 import argparse, sys, numpy as np, torch, torch.nn as nn
@@ -9,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 from torch_npu.contrib import transfer_to_npu
 torch.npu.set_compile_mode(jit_compile=False)
 from pcdet.config import cfg, cfg_from_yaml_file
@@ -16,7 +16,7 @@ from pcdet.datasets import KittiDataset
 from pcdet.utils import common_utils
 from pcdet.models.detectors.pointpillar import PointPillar
 
-import torchvision
+NUM_ANCHORS = 321408
 
 
 class PPWrapper(nn.Module):
@@ -32,46 +32,23 @@ class PPWrapper(nn.Module):
         return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
 
 
-class FullWrapper(nn.Module):
-    """PPWrapper + Sigmoid + Max + class-agnostic NMS（axis-aligned BEV）。"""
-    def __init__(self, model, iou_thresh=0.01, score_thresh=0.1, max_det=500):
+class PostprocWrapper(nn.Module):
+    """PPWrapper + Sigmoid + ReduceMax + 无 NMS，输出精简张量。"""
+    def __init__(self, model):
         super().__init__()
         self.base = PPWrapper(model)
-        self.iou_thresh = iou_thresh
-        self.score_thresh = score_thresh
-        self.max_det = max_det
 
     def forward(self, voxels, voxel_num_points, voxel_coords, bev_index_map):
         box_preds, cls_preds = self.base(voxels, voxel_num_points, voxel_coords, bev_index_map)
-        # (1,N,7) (1,N,3)
-        cls_sig = torch.sigmoid(cls_preds)                    # (1,N,3)
-        scores, labels = torch.max(cls_sig, dim=-1)           # (1,N)
-        scores = scores.squeeze(0)                            # (N,)
-        labels = labels.squeeze(0) + 1                        # (N,) 1-indexed
-        box = box_preds.squeeze(0)                            # (N,7) lidar
-
-        # 3D box -> axis-aligned BEV 2D box [x1,y1,x2,y2]
-        x, y = box[:, 0], box[:, 1]
-        dx, dy = box[:, 3], box[:, 4]
-        boxes2d = torch.stack([x - dx/2, y - dy/2, x + dx/2, y + dy/2], dim=1)  # (N,4)
-
-        # score 过滤
-        keep_mask = scores >= self.score_thresh
-        boxes2d = boxes2d[keep_mask]
-        scores = scores[keep_mask]
-        labels = labels[keep_mask]
-        box = box[keep_mask]
-
-        # NMS
-        keep = torchvision.ops.nms(boxes2d, scores, self.iou_thresh)
-        keep = keep[:self.max_det]
-
-        final_boxes = box[keep]          # (K,7)
-        final_scores = scores[keep]      # (K,)
-        final_labels = labels[keep]      # (K,)
-        final_count = final_boxes.shape[0]
-
-        return final_boxes, final_scores, final_labels, final_count
+        # cls_preds: (1, N, 3) f32, 未归一化
+        cls_sig = torch.sigmoid(cls_preds)  # (1, N, 3)
+        scores, labels = torch.max(cls_sig, dim=-1)  # (1, N)
+        labels = labels + 1  # 1-indexed: 1=Car,2=Ped,3=Cyc
+        # 去掉 batch 维
+        scores = scores.squeeze(0)  # (N,)
+        labels = labels.squeeze(0)  # (N,)
+        box_preds = box_preds.squeeze(0)  # (N, 7)
+        return box_preds, scores, labels
 
 
 def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None):
@@ -88,11 +65,8 @@ def main():
     p.add_argument("--config", default=str(ROOT / "data/config.yaml"))
     p.add_argument("--ckpt", default=str(ROOT / "weights/pointpillar_7728.pth"))
     p.add_argument("--sample-idx", default="000008")
-    p.add_argument("--output", default=str(ROOT / "weights/pointpillar_full.onnx"))
+    p.add_argument("--output", default=str(ROOT / "weights/pointpillar_postproc.onnx"))
     p.add_argument("--opset", type=int, default=16)
-    p.add_argument("--score-thresh", type=float, default=0.1)
-    p.add_argument("--iou-thresh", type=float, default=0.01)
-    p.add_argument("--max-det", type=int, default=500)
     args = p.parse_args()
 
     cfg_from_yaml_file(args.config, cfg)
@@ -119,13 +93,9 @@ def main():
     M = voxels.shape[0]
     bim = build_index_map(vc.cpu(), nx=432, ny=496, nz=1, M=M).npu()
 
-    wrapper = FullWrapper(model, iou_thresh=args.iou_thresh,
-                          score_thresh=args.score_thresh, max_det=args.max_det)
+    wrapper = PostprocWrapper(model)
     with torch.no_grad():
-        b, s, l, c = wrapper(voxels, vnp, vc, bim)
-    print("ref outputs:", b.shape, s.shape, l.shape, "count=", c.item(), flush=True)
-    print("ref top scores:", torch.sort(s, descending=True)[0][:5].tolist(), flush=True)
-    print("ref labels:", l.tolist(), flush=True)
+        box_ref, scores_ref, labels_ref = wrapper(voxels, vnp, vc, bim)
 
     with torch.no_grad():
         torch.onnx.export(
@@ -133,11 +103,18 @@ def main():
             (voxels, vnp, vc, bim),
             args.output,
             input_names=["voxels", "voxel_num_points", "voxel_coords", "bev_index_map"],
-            output_names=["final_boxes", "final_scores", "final_labels", "final_count"],
+            output_names=["batch_box_preds", "batch_scores", "batch_labels"],
             opset_version=args.opset,
             dynamo=False,
         )
     print("EXPORT DONE -> %s" % args.output, flush=True)
+
+    # ATC 命令
+    print("\nATC:", flush=True)
+    print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 \\" % args.output, flush=True)
+    print("      --output=%s --input_format=ND --log=error" % args.output.replace('.onnx', ''), flush=True)
+    print("      --input_shape='voxels:%d,32,4;voxel_num_points:%d;voxel_coords:%d,4;bev_index_map:214272'" % (M, M, M), flush=True)
+    print("      --precision_mode=force_fp16", flush=True)
 
 
 if __name__ == "__main__":

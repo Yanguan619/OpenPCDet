@@ -12,6 +12,8 @@ _PKG_ROOT = os.path.normpath(os.path.join(_HERE, "..", "unum_ops", "src", "unum_
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+
 import numpy as np
 import torch
 from torch_npu.contrib import transfer_to_npu

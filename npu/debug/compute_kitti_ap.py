@@ -11,13 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 import numpy as np
 import torch
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import KittiDataset
 from pcdet.utils import common_utils
-from pcdet.ops.iou3d_nms.iou3d_nms_torch_native import boxes_iou3d_gpu
+from npu.ops_native import boxes_iou3d_gpu
 
 CLASS_NAMES = ["Car", "Pedestrian", "Cyclist"]
 IOU_THRESH = {1: 0.7, 2: 0.5, 3: 0.5}

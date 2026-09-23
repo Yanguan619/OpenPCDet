@@ -1,8 +1,8 @@
-"""PyTorch 原模型全量 val 推理 -> 保存预测（与 eval_kitti_full.py 完全同管线，仅推理后端不同）。
+"""PyTorch 原模型全量 val 推理 -> 保存预测（与 om_ref_test.py 完全同管线，仅推理后端不同）。
 
 用法:
-    python npu/eval_kitti_full_pt.py --save-preds preds_pt
-    python npu/eval_kitti_full_pt.py --save-preds preds_pt --frames 3   # 抽验
+    python npu/om_ref_test_pt.py --save-preds preds_pt
+    python npu/om_ref_test_pt.py --save-preds preds_pt --frames 3   # 抽验
 """
 
 import argparse
@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+
 import numpy as np
 import torch
 from pcdet.config import cfg, cfg_from_yaml_file
@@ -22,7 +24,7 @@ from pcdet.models.detectors.pointpillar import PointPillar
 from pcdet.models.model_utils import model_nms_utils
 from pcdet.utils import common_utils
 
-from npu.run_bin import to_tensor, build_index_map
+from npu.om_ref_demo import to_tensor, build_index_map
 from npu.export_onnx import PPWrapper
 
 CLASS_NAMES = ["Car", "Pedestrian", "Cyclist"]

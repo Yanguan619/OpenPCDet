@@ -10,9 +10,11 @@ except:
     import mayavi.mlab as mlab
     from visual_utils import visualize_utils as V
     OPEN3D_FLAG = False
-
+import time
 import numpy as np
 import torch
+from torch_npu.contrib import transfer_to_npu
+torch.npu.set_compile_mode(jit_compile=False)
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import DatasetTemplate
@@ -95,8 +97,15 @@ def main():
             logger.info(f'Visualized sample index: \t{idx + 1}')
             data_dict = demo_dataset.collate_batch([data_dict])
             load_data_to_gpu(data_dict)
+            time_start = time.time()
             pred_dicts, _ = model.forward(data_dict)
-
+            print('Inference time: {:.4f}s'.format(time.time() - time_start))
+            pd = pred_dicts[0]
+            import numpy as _np
+            for b, s, l in zip(pd['pred_boxes'].cpu().numpy(), pd['pred_scores'].cpu().numpy(), pd['pred_labels'].cpu().numpy()):
+                print('  %-10s %8.2f %8.2f %8.2f %6.2f %6.2f %6.2f %8.3f %8.3f'
+                      % (cfg.CLASS_NAMES[int(l) - 1], b[0], b[1], b[2], b[3], b[4], b[5], b[6], s))
+            exit(0)
             V.draw_scenes(
                 points=data_dict['points'][:, 1:], ref_boxes=pred_dicts[0]['pred_boxes'],
                 ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels']

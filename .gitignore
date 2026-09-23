@@ -28,3 +28,4 @@ ge_check_op.json
 spconv
 # 豁免（保留脚本）
 !npu/verify_npu.sh
+npu/debug/profiler*

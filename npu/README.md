@@ -22,14 +22,13 @@ npu/
 ├── verify_npu.sh       # 环境→补丁→推理→评测 串联验证
 ├── quick_eval.py       # 快速评估（GPU/NPU 通用，生成 preds + 自动官方评测）
 ├── compute_kitti_ap.py # 快速 BEV AP（sanity check）
-├── eval_kitti_full.py      # 全量 val 推理（OM 后端）
-├── eval_kitti_full_pt.py   # 全量 val 推理（PyTorch 后端）
-├── eval_official_kitti.py  # 官方 KITTI 评测（读 preds 目录）
+├── om_ref_test.py      # 全量 val 评测（OM 后端，内嵌官方 AP；--quick 简化口径）
+├── om_ref_test_pt.py   # 全量 val 推理（PyTorch 后端）
 ├── export_onnx.py      # ONNX 导出 + 图手术（含 NMS）
 ├── export_full.py      # PyTorch 直接导出（含后处理，替代图手术方案）
 ├── export_postproc.py  # 导出 PPWrapper+后处理（无 NMS）
 ├── atc.py              # ATC 转 OM（动态/静态/fp32/fp16/mixed）
-├── run_bin.py          # 单帧 .bin 推理（OM，分段计时）
+├── om_ref_demo.py          # 单帧 .bin 推理（OM，分段计时）
 ├── demo.py             # 单帧 demo（可视化）
 ├── perf_e2e.py         # E2E 性能测试
 ├── compare_pt_om.py    # PyTorch vs OM 数值对比
@@ -79,12 +78,12 @@ python npu/atc.py --fp32 --skip-export
 #   或等价命令：--precision_mode=force_fp32 --soc_version=Ascend310P3
 
 # 3. OM 单帧推理
-python npu/run_bin.py --bin data/kitti/training/velodyne/000008.bin \
+python npu/om_ref_demo.py --bin data/kitti/training/velodyne/000008.bin \
     --om weights/pointpillar_fp32_linux_aarch64.om --num-iters 20
 
-# 4. 全量 val 评测（OM 后端）
-python npu/eval_kitti_full.py --om weights/pointpillar_mixed_float16_dyn9000_linux_aarch64.om \
-    --save-preds preds_om
+# 4. 全量 val 评测（OM 后端，内嵌官方 AP 评测，R11/R40 bbox/bev/3d）
+python npu/om_ref_test.py --om weights/pointpillar_mixed_float16_dyn9000_linux_aarch64.om
+python npu/om_ref_test.py --om <om> --quick     # 只看简化 Recall/Precision
 ```
 
 ### 输入输出规格（ONNX/OM）

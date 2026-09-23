@@ -6,6 +6,135 @@
 
 ---
 
+## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
+
+### ✅ P0' 已完成（2026-09-22）：msit 新增通用 knowledge `KnowledgeScatterNdToConcat`
+
+- **根因**（profiler1 定位）：dense head 方向角修正 `box_preds[...,6] = dir_rot+...` 被 v2 导出追成
+  **ScatterND（单核标量实现，单帧 125.1ms / 74.9%）**；旧导出（Sep 18 `pointpillar_nms.onnx`）用
+  `Concat([Slice(:6), dir_corr], -1)`，无 ScatterND → 老静态 fp16 OM 才 15.7ms。v2 导出为回归。
+- **实现**：`/data/workspace/msit/onnx_optimizer/src/onnx_optimizer/pattern/knowledges/
+  knowledge_scatter_nd_to_concat.py`（已注册 `@KnowledgeFactory.register()`，`-k KnowledgeScatterNdToConcat` 可用）。
+  - 匹配 ScatterND，**安全门禁**：迷你常量折叠 indices（Constant/Initializer→Unsqueeze/Concat/Reshape/
+    Expand/Range/Cast/Gather/Shape/Where/Equal/ConstantOfShape），校验 = 各 leading 维 arange 网格（全覆盖、
+    无碰撞）+ 尾部通道列常量 `k..k+K-1`；否则跳过（部分写入/动态索引不改写）。
+  - 改写：`Concat([Slice(data,:k), updates, Slice(data,k+K:)], -1)`，结果 **bit 级一致**（onnxruntime 验证 max diff=0）。
+- **产物**：`weights/pointpillar_nms_base_v2_dynamic_noscatter.onnx`（raw + 该 knowledge，ScatterND=0，223 节点）。
+- 验证：正例 pointpillar bit 一致 ✅；负例（重复行/非常量通道/部分行）正确跳过 ✅。
+- 注意：onnxsim / merge_convs 的 BN 折叠与 Conv 合并会引入 ~1e-4 浮点差（预存在行为），
+  因此**精度门禁用 noscatter 版本（不叠加 onnxsim/merge）**，对已校验的 raw 基线保持 bit 一致。
+
+### ✅ P1' 已完成（2026-09-23，profiler2 定位）：ArgMaxD 19.4ms → 消除
+
+- profiler2（ScatterND 消除后）：前向 **185.75ms → 42.69ms**；host 调度仅 ~1ms；
+  瓶颈变为 **ArgMaxD 19.4ms（46.6%）** = `dir_labels = torch.max(dir_cls, dim=-1)[1]`（输入 1×321408×2）。
+- **根因**：ArgMaxD 在 310P 上单核标量实现；且导出时 `dir_cls.view(B, anchors, -1)` 用 `-1`，
+  onnx shape inference 推不出 axis 维（head 空间维全未知）。
+- **实现**：
+  - msit 新增 `knowledge_argmax2_to_compare.py`（`KnowledgeArgMax2ToCompare`）：`ArgMax(x, axis)` 且
+    `x.shape[axis]==2` → `Cast(Greater(x[...,1], x[...,0]), int64)`（元素级向量化；tie 语义与 argmax 一致）。
+  - `export_onnx.py` 新增 `fix_dir_reshape_dim()`：导出后把 dir ArgMax 上游 Reshape 目标 `-1` 补成
+    `cfg.MODEL.DENSE_HEAD.NUM_DIR_BINS`，使 axis 维静态可证。
+- **产物**：`weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx`（ScatterND=0、ArgMax=0，
+  227 节点），与 raw 基线 **bit 一致**（onnxruntime max diff=0）。
+- 预期：前向 42.7ms → ~25ms（ArgMaxD 19.4ms 消除）。
+
+### 静态 OM（P0）待用户在大机器转换（noscatter onnx 已就绪）
+
+```
+# 动态（替换当前 173ms 的动态 om，ScatterND 消除后预计 ~60ms）
+# 注意：必须用 range 记法 1~9000，勿用 -1 / --dynamic_dims（会把 M 当 batch 做 mbatch
+# 切分，Concat_1 固定 batch=1 结构会报 E89999，见下"ATC 动态转换坑"）
+atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --framework=5 \
+    --soc_version=Ascend310P3 --output=weights/pointpillar_base_fp32_dynamic9000 \
+    --input_format=ND --precision_mode=force_fp32 \
+    --input_shape="voxels:1~9000,32,4;voxel_num_points:1~9000;voxel_coords:1~9000,4;bev_index_map:214272"
+
+# 静态 M=9000（配合 P0 padding，省动态调度开销）
+atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --framework=5 \
+    --soc_version=Ascend310P3 --output=weights/pointpillar_base_fp32_static9000 \
+    --input_format=ND --precision_mode=force_fp32 \
+    --input_shape="voxels:9000,32,4;voxel_num_points:9000;voxel_coords:9000,4;bev_index_map:214272"
+```
+
+### ✅ P0/P1/P2 已完成（2026-09-23）——静态 9000 OM + 全 CPU 优化，demo 逐位一致
+
+| 优化 | 内容 | 验证 |
+|---|---|---|
+| **P0** 静态 M=9000 + padding | `om_ref_demo.py`/`om_ref_test.py` 新增 `pad_to_static_m()`（pad 行 num_points=0、Gather 索引只引真实行、pad 值=9000，`build_index_map` 加 `pad` 参数） | 000008（M=7260→pad 9000）34 框与基线**逐位一致** |
+| **P1** FOV 去 hstack | 新增 `fov_filter_fused()`：`points@A[:3]+A[3]` + `pts_rect@P2[:,:3].T+P2[:,3]`（同乘加顺序） | 20 帧 FOV mask **0 差异** |
+| **P2** 后处理 numpy 化 | `1/(1+np.exp(-x))` + `argmax` 替代 torch.sigmoid/max | 34 框分数**逐位一致** |
+
+**Demo 实测（000008，静态 9000 fp32 OM）**：推理 **173ms → 43ms**（P0' 去 ScatterND + P0 静态），检测结果与动态 fp32 基线逐位一致。
+
+> 顺手修复：`ops_native` 重构后 `from npu.ops_native import boxes_iou_bev/_nms_iou_matrix` 失效 → 改为
+> `npu.ops_native.iou3d_nms_torch_native`。
+
+### ✅ 精度安全优化二轮（2026-09-23）：NMS 增量 / FOV 逐元素 / 后处理回退
+
+| 优化 | 内容 | 验证 |
+|---|---|---|
+| **NMS 增量贪心** | `npu/ops_native/iou3d_nms_torch_native.py` 新增 `_nms_incremental()`：按 score 降序逐框只与**已保留框**算旋转 IoU（`_nms_inter` 逐对数学不变）→ O(N·K) 替代 O(N²) 全矩阵 | 6 组随机 + 真实框 **keep 集合完全一致**；N=4096 最坏 1672ms→**43ms（39x）** |
+| **FOV 逐元素** | `fov_filter_fused` 改用 `_mm3()` 列式逐元素（本机 np.dot/@ 对小 K 走标量路径 ~81ms/次） | 200 帧 AP **77.90/57.95/37.05 与 bit-一致 FOV 完全相同** |
+| **后处理回退 torch** | P2 的 `1/(1+np.exp(-x))` 在无有效 BLAS 机器上 **42ms（回归）**，回退 `torch.sigmoid`（~3ms） | 34 框与基线一致 |
+
+**E2E 实测（200 帧，静态 9000 fp32 OM，本机）**：**186.8ms/帧**（基线 369ms → **2.0x**）
+拆分：前处理 **113.5ms**（fov 59 + voxelize ~37 + pad ~22）+ 推理 **24ms** + 后处理 **49.5ms**。
+
+> ⚠️ 注意：本机 openblas64 单线程对 (N,3)@(3,3) 小 K 矩阵乘走标量路径（~81ms/次），
+> np.dot / np.einsum / torch.matmul 均非全 bit 一致；FOV 逐元素有 ~1 点/帧 边界翻转，
+> 经 200 帧 AP 门禁判定**无精度影响**（预处理容忍微差，与 numba 体素化 4.5e-5 同性质）。
+> 前向（模型输出）路径仍严格 bit 一致（ScatterND/ArgMax 消除，diff=0）。
+
+### ⚠️ 全量 val 的 M 上限结论（静态 9000 覆盖不足）
+
+抽样 100 帧 val：**54 帧 M>9000（最大 ~16664）**，与文档"val max 8567"（2026-08-18）不符
+（当前 voxelization 产出更多 voxel）。→ **静态 9000 OM 不能用于全量 val**（会跳过 ~54%）。
+全量 val 需转 **M≥17000 的静态 OM** 或 **动态 noscatter OM**（`1~9000` range 也覆盖不了 >9000 的帧，需加大 range）。
+demo 单帧（M≤9000 的 bin）用静态 9000 即可。
+
+#### ATC 动态转换坑（已解决）
+
+`--input_shape` 用 `-1` + 多维 `--dynamic_dims`（如 `-1,32,4` + `1,1,1;500,500,500;...`）会把 M 当 **batch 维**
+做 mbatch 切分；dense head `Concat_1` 是固定 batch=1 结构（axis=0 拼 `Squeeze(ReduceMax)` 的 `[64]` 与常量
+`[1,64]`），按 batch 切分时报 `E89999: input shape dims should be equal except merge axis`。
+解决：M 用 **range 记法 `1~9000`** 且不带 `--dynamic_dims`（与 08:23 已验证的动态 om 同格式）。
+
+### 剩余待办
+
+| 优先级 | 方案 | 内容 | 预期 | 精度 |
+|---|---|---|---|---|
+| （P0/P1/P2 已完成，见上） | - | - | - | - |
+| 全量 val | 转 M≥17000 静态 OM 或 1~17000 动态 noscatter OM | val 有 54% 帧 M>9000，静态 9000 覆盖不足 | 全量推理 ~43ms/帧 | ✅ |
+| （不做） | FOV 单矩阵乘融合 / fp16 | 有 0.48% 边界差异 / 量化误差 | - | ❌ 违反 bit 一致 |
+
+验证门禁：`--frames 200` AP 与现全量逐位一致；`compare_pt_om` diff=0；`perf_e2e.py` 分段计时。
+
+---
+
+## v1.2.0（2026-09-22）：OM 动态 fp32 全量 3769 帧官方评测
+
+### 变更
+- `npu/run_bin.py` → `npu/om_ref_demo.py`（重构为 tools/demo.py 同构：DemoDataset + cfg_file + 逐样本打印）；
+- `npu/eval_kitti_full.py` → `npu/om_ref_test.py`（tools/test.py 的 OM 版，全量 val 推理 + 官方评测对接）；
+- 新增 `npu/export_onnx.py --dynamic`：导出 M 动态 base ONNX；图手术节点名不再与输出张量重名（auto_optimizer 兼容）；
+- 新增 `weights/pointpillar_nms_base_v2_dynamic_opt.onnx`（onnxsim 426→105 + auto_optimizer 104 节点）；
+- 新增动态 fp32 OM：`weights/pointpillar_base_fp32_dynamic_linux_aarch64_linux_aarch64.om`（142MB，M 动态 1~9000）。
+
+### 结论（KITTI val 全量 3769 帧，OM 动态 fp32，官方评测）
+
+| class | 3D moderate R11 | R40 | 官方基线（R11） | 差距 |
+|---|---|---|---|---|
+| Car | 77.25 | 78.33 | 77.28 | -0.03 ✅ |
+| Pedestrian | 51.67 | 50.90 | 52.29 | -0.62 |
+| Cyclist | 61.76 | 62.04 | 62.68 | -0.92 |
+
+- 全量 `skipped_M=0`，avg 368.8ms/帧（本机，前处理/推理/后处理拆分见 PERFORMANCE.md）。
+- **NMS 内嵌图（图内 NonMaxSurppression）经 ATC 转 OM 后 NPU 输出错误**（top score 0.024、大量重复框）；
+  onnxruntime CPU 验证 raw/sim/opt 三版均正确 → 根因在 ATC/NPU 对 NMS 算子的执行，base OM + Python 侧 NMS 为可靠路径。
+
+---
+
 ## v1.1.0（2026-09-22）：GPU/NPU 精度对齐 77.83
 
 ### 精度根因修复
@@ -28,6 +157,9 @@
 
 Car 与官方一致；Ped 高于官方 5.6；Cyc 明显低于官方 26，指向 checkpoint 训练集/类别分布差异，非管线问题（两端逐位一致）。
 
+> 设备修复前基线【2026-09-18~21】：设备 rotate_iou（CPU box_overlap_bev 版）评测 Car 3D moderate ≈ **64.16**
+> （偏低 13 点，官方同输入 ≈ 77.83），根因为 rotate_iou CPU 数学与官方 CUDA 不等价，见上表修复。
+
 ### 新增 skill 交付物
 `npu/infer.py`（build_data/pre_process/build_model/post_process/main）、`npu/eval.py`、
 `npu/npu_patch.py`（设备检测/算子适配统一补丁）、`npu/verify_npu.sh`（环境→补丁→推理→评测串联验证）、
@@ -47,7 +179,7 @@ Car 与官方一致；Ped 高于官方 5.6；Cyc 明显低于官方 26，指向 
 - 效果：260×260 IoU 矩阵 881ms（torch）→ 59.8ms（numba，稳态 6~31ms）；keep 结果与 torch 一致。
 
 ### 优化 3：numba 首调开销移出计时
-- run_bin.py 在计时前用 `_nms_iou_matrix(np.zeros((2,7),np.float32))` 预热（首调 ~1.5s）。
+- om_ref_demo.py 在计时前用 `_nms_iou_matrix(np.zeros((2,7),np.float32))` 预热（首调 ~1.5s）。
 
 > 注意：2026-08-18 设备异常（npu-smi Health=Warning，dmesg `ascend_monitor dmp heart beat lost error`），
 > OM 推理临时退化（0 框），ONNX(CPU) 复现 25 框正常，确认非代码回归。

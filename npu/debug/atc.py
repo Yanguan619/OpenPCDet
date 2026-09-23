@@ -13,13 +13,15 @@ PointPillars 一键转换: PyTorch -> ONNX -> 简化 -> 图手术 -> OM (Ascend3
   python npu/atc_convert.py --onnx /path/to/model.onnx        # 指定已有 ONNX(跳过导出)
   python npu/atc_convert.py --fp32                             # force_fp32(精度最高)
   python npu/atc_convert.py --mixlist path/to/mix.json        # 自定义混合精度名单
-  python npu/atc_convert.py --no-graphopt                    # 跳过图手术(仅 onnxsim)
+  python npu/atc_convert.py --no-graphopt                    # 跳过图手术(仅 onnxsim+onnxslim)
+  python npu/atc_convert.py --no-onnxslim                    # 跳过 onnxslim(仅 onnxsim)
 
 Pipeline 步骤:
   [0] ONNX 导出 (export_onnx.py, 动态 shape)
-  [1] ONNX 简化 (onnxsim)
-  [2] 图手术: auto_optimizer (Cast 合并 + Conv 合并)
-  [3] ATC 转换
+  [1] ONNX 简化 (auto_optimizer simplify = onnxsim)
+  [2] ONNX 深度简化 (auto_optimizer slim = onnxslim)
+  [3] 图手术: auto_optimizer opt (Cast 合并 + Conv 合并)
+  [4] ATC 转换
 """
 import argparse
 import json
@@ -90,25 +92,33 @@ def step0_export_onnx(ckpt: Path, sample_idx: str, output: Path, skip: bool):
 
 
 def step1_simplify(onnx_path: Path, simplified: Path):
-    print(f"[1/4] ONNX 简化: {onnx_path} -> {simplified}")
+    print(f"[1/5] ONNX 简化 (auto_optimizer simplify / onnxsim): {onnx_path} -> {simplified}")
     if simplified.exists():
         print(f"  简化结果已存在,跳过: {simplified}")
         return
-    run(["onnxsim", str(onnx_path), str(simplified), "--no-large-tensor"])
+    run(["auto_optimizer", "simplify", str(onnx_path), str(simplified), "--no-large-tensor"])
 
 
-def step2_graph_opt(simplified: Path, final_onnx: Path, no_graphopt: bool):
-    if no_graphopt:
-        print("[2/4] 跳过图手术 (--no-graphopt)")
+def step1b_onnxslim(simplified: Path, slimmed: Path):
+    print(f"[2/5] ONNX 深度简化 (auto_optimizer slim / onnxslim): {simplified} -> {slimmed}")
+    if slimmed.exists():
+        print(f"  onnxslim 结果已存在,跳过: {slimmed}")
         return
-    print("[2/4] 图手术: auto_optimizer (Cast 合并 + Conv 合并)")
+    run(["auto_optimizer", "slim", str(simplified), str(slimmed)])
+
+
+def step2_graph_opt(slimmed: Path, final_onnx: Path, no_graphopt: bool):
+    if no_graphopt:
+        print("[3/5] 跳过图手术 (--no-graphopt)")
+        return
+    print("[3/5] 图手术: auto_optimizer (Cast 合并 + Conv 合并)")
     if final_onnx.exists():
         print(f"  图手术结果已存在,跳过: {final_onnx}")
         return
     run([
         "auto_optimizer", "opt",
         "-k", "KnowledgeMergeCasts,KnowledgeMergeConvs",
-        str(simplified), str(final_onnx),
+        str(slimmed), str(final_onnx),
     ])
 
 
@@ -163,6 +173,7 @@ def main():
     p.add_argument("--fp32", action="store_true", help="force_fp32(精度最高)")
     p.add_argument("--static", action="store_true", help="静态 shape M=3941, force_fp16+全融合")
     p.add_argument("--no-graphopt", action="store_true")
+    p.add_argument("--no-onnxslim", action="store_true", help="跳过 onnxslim(仅 onnxsim)")
     p.add_argument("--mixlist", default=None)
     args = p.parse_args()
 
@@ -176,8 +187,10 @@ def main():
 
     onnx_path = Path(args.onnx) if args.onnx else (ROOT / "weights" / "pointpillar_demo.onnx")
     simplified = onnx_path.with_name(onnx_path.stem + "_sim.onnx")
+    slimmed = (simplified if args.no_onnxslim
+               else onnx_path.with_name(onnx_path.stem + "_slim.onnx"))
     final_onnx = (onnx_path.with_name(onnx_path.stem + "_opt.onnx")
-                  if not args.no_graphopt else simplified)
+                  if not args.no_graphopt else slimmed)
 
     # mixlist: 默认写到临时位置;若用户指定则使用用户指定
     if args.mixlist:
@@ -195,24 +208,27 @@ def main():
         print("       请先运行: python npu/export_onnx.py", file=sys.stderr)
         sys.exit(1)
 
-    # ---- Step 1: ONNX 简化 ----
+    # ---- Step 1: ONNX 简化 (onnxsim) ----
     step1_simplify(onnx_path, simplified)
 
     # 从 ONNX 推断 G (bev_index_map 长度,固定值)
     g = onnx_input_dim(simplified, "bev_index_map")
     print(f"  bev_index_map G={g}")
 
-    # ---- Step 2: 图手术 ----
-    step2_graph_opt(simplified, final_onnx, args.no_graphopt)
+    # ---- Step 2: ONNX 深度简化 (onnxslim) ----
+    step1b_onnxslim(simplified, slimmed)
+
+    # ---- Step 3: 图手术 ----
+    step2_graph_opt(slimmed, final_onnx, args.no_graphopt)
     print(f"  最终 ONNX: {final_onnx}")
 
-    # ---- Step 3: ATC 转换 ----
+    # ---- Step 4: ATC 转换 ----
     atc_cmd = build_atc_cmd(final_onnx, out_prefix, mode, static, g, mixlist)
     if static:
-        print(f"[3/4] ATC 静态 shape 转换 (mode={mode}): {final_onnx} -> {out_prefix}")
+        print(f"[4/5] ATC 静态 shape 转换 (mode={mode}): {final_onnx} -> {out_prefix}")
         print(f"  M=3941 (静态), G={g}")
     else:
-        print(f"[3/4] ATC 动态 shape 转换 (mode={mode}): {final_onnx} -> {out_prefix}")
+        print(f"[4/5] ATC 动态 shape 转换 (mode={mode}): {final_onnx} -> {out_prefix}")
     run(atc_cmd)
 
     # 查找生成的 OM 文件
@@ -229,7 +245,7 @@ def main():
     print("=" * 44)
     print("验证:")
     if static:
-        print(f"  python npu/run_bin.py --bin data/kitti/training/velodyne/000008.bin --om {om_file} --score-thresh 0.3")
+        print(f"  python npu/om_ref_demo.py --bin data/kitti/training/velodyne/000008.bin --om {om_file} --score-thresh 0.3")
     else:
         print(f"  python tools/test_om.py --om {om_file} --max-samples 100 --detail")
 

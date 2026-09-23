@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 import aclruntime
 import numpy as np
@@ -22,7 +23,7 @@ from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import KittiDataset
 from pcdet.utils import common_utils
 
-from npu.run_bin import to_tensor, build_index_map, tensor_to_numpy
+from npu.om_ref_demo import to_tensor, build_index_map, tensor_to_numpy
 
 NUM_ANCHORS = 321408
 CLASS_NAMES = ["Car", "Pedestrian", "Cyclist"]

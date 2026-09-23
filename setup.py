@@ -2,7 +2,7 @@ import os
 import subprocess
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
 
 
 def get_git_commit_number():
@@ -15,6 +15,7 @@ def get_git_commit_number():
 
 
 def make_cuda_ext(name, module, sources):
+    from torch.utils.cpp_extension import CUDAExtension
     cuda_ext = CUDAExtension(
         name='%s.%s' % (module, name),
         sources=[os.path.join(*module.split('.'), src) for src in sources]
@@ -31,31 +32,13 @@ if __name__ == '__main__':
     version = '0.6.0+%s' % get_git_commit_number()
     write_version_to_file(version, 'pcdet/version.py')
 
-    setup(
-        name='pcdet',
-        version=version,
-        description='OpenPCDet is a general codebase for 3D object detection from point cloud',
-        install_requires=[
-            'numpy',
-            'llvmlite',
-            'numba',
-            'tensorboardX',
-            'easydict',
-            'pyyaml',
-            'scikit-image',
-            'tqdm',
-            'SharedArray',
-            # 'spconv',  # spconv has different names depending on the cuda version
-        ],
-
-        author='Shaoshuai Shi',
-        author_email='shaoshuaics@gmail.com',
-        license='Apache License 2.0',
-        packages=find_packages(exclude=['tools', 'data', 'output']),
-        cmdclass={
-            'build_ext': BuildExtension,
-        },
-        ext_modules=[
+    cuda_available = getattr(torch, 'cuda', None) is not None and torch.cuda.is_available()
+    ext_modules = []
+    cmdclass = {}
+    if cuda_available:
+        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+        cmdclass = {'build_ext': BuildExtension}
+        ext_modules = [
             make_cuda_ext(
                 name='iou3d_nms_cuda',
                 module='pcdet.ops.iou3d_nms',
@@ -92,10 +75,10 @@ if __name__ == '__main__':
                     'src/group_points.cpp',
                     'src/group_points_gpu.cu',
                     'src/sampling.cpp',
-                    'src/sampling_gpu.cu', 
-                    'src/interpolate.cpp', 
+                    'src/sampling_gpu.cu',
+                    'src/interpolate.cpp',
                     'src/interpolate_gpu.cu',
-                    'src/voxel_query.cpp', 
+                    'src/voxel_query.cpp',
                     'src/voxel_query_gpu.cu',
                     'src/vector_pool.cpp',
                     'src/vector_pool_gpu.cu'
@@ -133,5 +116,31 @@ if __name__ == '__main__':
                     'src/ingroup_inds_kernel.cu',
                 ]
             ),
+        ]
+    else:
+        print('CUDA is not available, skip compiling CUDA extensions.')
+
+    setup(
+        name='pcdet',
+        version=version,
+        description='OpenPCDet is a general codebase for 3D object detection from point cloud',
+        install_requires=[
+            'numpy',
+            'llvmlite',
+            'numba',
+            'tensorboardX',
+            'easydict',
+            'pyyaml',
+            'scikit-image',
+            'tqdm',
+            'SharedArray',
+            # 'spconv',  # spconv has different names depending on the cuda version
         ],
+
+        author='Shaoshuai Shi',
+        author_email='shaoshuaics@gmail.com',
+        license='Apache License 2.0',
+        packages=find_packages(exclude=['tools', 'data', 'output']),
+        cmdclass=cmdclass,
+        ext_modules=ext_modules,
     )

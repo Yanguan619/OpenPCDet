@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+
 NUM_ANCHORS = 321408
 
 
@@ -103,6 +105,15 @@ def export_base_onnx(output_path, args):
             return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
 
     wrapper = PPWrapper(model)
+    dynamic_axes = None
+    if getattr(args, "dynamic", False):
+        dynamic_axes = {
+            "voxels": {0: "M"},
+            "voxel_num_points": {0: "M"},
+            "voxel_coords": {0: "M"},
+            "batch_box_preds": {0: "batch"},
+            "batch_cls_preds": {0: "batch"},
+        }
     with torch.no_grad():
         torch.onnx.export(
         wrapper,
@@ -113,8 +124,63 @@ def export_base_onnx(output_path, args):
         opset_version=args.opset,
         dynamo=False,
         do_constant_folding=False,
+        dynamic_axes=dynamic_axes,
     )
+    fix_dir_reshape_dim(output_path, num_dir_bins=cfg.MODEL.DENSE_HEAD.NUM_DIR_BINS)
     print("base ONNX -> %s" % output_path, flush=True)
+
+
+def fix_dir_reshape_dim(output_path, num_dir_bins):
+    """把 dir argmax 上游 Reshape 目标里的 -1 补成 NUM_DIR_BINS。
+
+    否则 onnx shape inference 推不出 ArgMax 输入的通道数（head 空间维全未知），
+    KnowledgeArgMax2ToCompare 无法静态证明 axis 维 == 2。此处直接用配置值补全。
+    """
+    import onnx as _onnx
+    from onnx import numpy_helper as _nh
+
+    model = _onnx.load(output_path)
+    g = model.graph
+    nodes = list(g.node)
+    prods = {o: n for n in nodes for o in n.output}
+
+    def target_arr(name):
+        for init in g.initializer:
+            if init.name == name:
+                return _nh.to_array(init)
+        n = prods.get(name)
+        if n is not None and n.op_type == "Constant":
+            for a in n.attribute:
+                if a.name == "value":
+                    return _nh.to_array(a.t)
+        return None
+
+    changed = False
+    for am in nodes:
+        if am.op_type != "ArgMax":
+            continue
+        axis = int([a.i for a in am.attribute if a.name == "axis"][0])
+        resh = prods.get(am.input[0])
+        if resh is None or resh.op_type != "Reshape":
+            continue
+        tgt = target_arr(resh.input[1])
+        if tgt is None or -1 not in tgt:
+            continue
+        n = tgt.shape[0]
+        ax = axis + n if axis < 0 else axis
+        if not (0 <= ax < n and tgt[ax] == -1):
+            continue
+        tgt[ax] = int(num_dir_bins)
+        new_init = _nh.from_array(tgt, resh.input[1])
+        for i, init in enumerate(g.initializer):
+            if init.name == resh.input[1]:
+                del g.initializer[i]
+                g.initializer.insert(i, new_init)
+                changed = True
+                break
+    if changed:
+        _onnx.save(model, output_path)
+        print("  fix_dir_reshape_dim: patched ArgMax reshape -1 -> %s" % num_dir_bins, flush=True)
 
 
 # ============================================================
@@ -340,6 +406,10 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
         graph.output.extend([out_info])
 
     all_nodes = list(nodes) + new_nodes
+    # auto_optimizer 要求节点名与张量名全局唯一：把与自身输出张量同名的节点重命名
+    for _n in all_nodes:
+        if _n.name and _n.name in _n.output:
+            _n.name = _n.name + "_op"
     graph.ClearField("node")
     graph.node.extend(all_nodes)
 
@@ -367,6 +437,7 @@ def main():
     parser.add_argument("--output", default=str(ROOT / "weights/pointpillar_nms.onnx"))
     parser.add_argument("--base-output", default=str(ROOT / "weights/pointpillar_nms_base.onnx"))
     parser.add_argument("--skip-export", action="store_true", help="复用已有 base ONNX，只做图手术")
+    parser.add_argument("--dynamic", action="store_true", help="导出时把 voxels 的 M 维度标为动态")
     parser.add_argument("--score-thresh", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.01)
     parser.add_argument("--max-det", type=int, default=500)

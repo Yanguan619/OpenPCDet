@@ -1,6 +1,6 @@
 """NPU 评测入口：对 infer.py 产出的预测执行官方 KITTI 评测。
 
-复用项目原有评测逻辑（eval_official_kitti.py / kitti_object_eval_python），
+复用项目原有评测逻辑（kitti_object_eval_python，官方评测已内嵌 om_ref_test/quick_eval），
 计算 bbox / bev / 3d AP（R11 与 R40，easy/moderate/hard）。
 
 用法:
@@ -15,14 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
-from npu.npu_patch import init_patch
+from npu.npu_patch import init_patch, patch_rotate_iou
 
 import numpy as np
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import KittiDataset
-from pcdet.datasets.kitti.kitti_object_eval_python import eval as kitti_eval
 from pcdet.utils import box_utils, common_utils
+
+patch_rotate_iou()
+from pcdet.datasets.kitti.kitti_object_eval_python import eval as kitti_eval  # noqa: E402
 
 CLASS_NAMES = ["Car", "Pedestrian", "Cyclist"]
 

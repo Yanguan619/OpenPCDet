@@ -4,8 +4,6 @@
 
 用法:
     python npu/quick_eval.py --frames 200 --save-preds /tmp/gpu_preds
-    # 之后:
-    python npu/eval_official_kitti.py --preds /tmp/gpu_preds
 """
 
 import argparse
@@ -16,6 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
+
+import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 import numpy as np
 import torch
@@ -156,6 +156,8 @@ def main():
     # 自动跑官方评测
     print("\n运行官方评测 ...", flush=True)
     sys.path.insert(0, str(ROOT))
+    from npu.npu_patch import patch_rotate_iou
+    patch_rotate_iou()
     from pcdet.datasets.kitti.kitti_object_eval_python import eval as kitti_eval
 
     gt_annos = [info['annos'] for info in demo_dataset.kitti_infos[:args.frames]]

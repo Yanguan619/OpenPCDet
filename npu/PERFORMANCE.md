@@ -98,7 +98,7 @@ NMS 数据依赖、串行裁剪多，且需把 321408×7≈9MB 框从 NPU 回传
 ## 7. 优化方向（待办）
 
 1. **前处理并行化**：`multiprocessing.Pool` 把多帧 voxelization 分散到多核（当前单线程串行）。
-2. **Ascend 前处理融合算子（方案 A）**：落地顺序 → ① 上板实测现有 voxelization kernel → ② kernel 向量化调优 → ③ 扩展 FOV+mask 为融合算子 → ④ ONNX-CPU 精度复核门禁 → ⑤ 接入 run_bin。
+2. **Ascend 前处理融合算子（方案 A）**：落地顺序 → ① 上板实测现有 voxelization kernel → ② kernel 向量化调优 → ③ 扩展 FOV+mask 为融合算子 → ④ ONNX-CPU 精度复核门禁 → ⑤ 接入 om_ref_demo。
 3. **静态 shape**：固定 M 可省 `set_dynamic_shape` 开销，但仅适用于非空 pillar 数恒定的场景。
 4. **后处理**：sigmoid + topk + NMS 纯 numpy/numba 化，减少张量往返。
 
@@ -106,7 +106,7 @@ NMS 数据依赖、串行裁剪多，且需把 321408×7≈9MB 框从 NPU 回传
 
 ```bash
 # OM 单帧（分段计时，--num-iters 取平均）
-python npu/run_bin.py --bin data/kitti/training/velodyne/000008.bin \
+python npu/om_ref_demo.py --bin data/kitti/training/velodyne/000008.bin \
     --om weights/pointpillar_fp16_static.om --num-iters 10
 
 # E2E 性能测试
