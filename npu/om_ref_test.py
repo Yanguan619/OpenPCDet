@@ -150,6 +150,14 @@ def match_one_frame(boxes, labels, scores, gt_objs, iou_thresh):
     return result, gt_by, det_by
 
 
+# get_image_shape 每帧 io.imread 读 PNG ~49ms；PIL 只解析 PNG 头（IHDR）即可得尺寸，~0.2ms
+def _fast_image_shape(root_split_path, idx):
+    from PIL import Image
+    img_file = Path(root_split_path) / 'image_2' / ('%s.png' % idx)
+    with Image.open(str(img_file)) as im:
+        return np.array([im.size[1], im.size[0]], dtype=np.int32)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Full KITTI val precision eval via OM")
     parser.add_argument("--config", default=str(ROOT / "data/config.yaml"))
@@ -215,6 +223,13 @@ def main():
         _nms_incremental(np.zeros((2, 7), dtype=np.float32), 0.01)  # numba 预热
     except Exception:
         pass
+    try:
+        # FOV numba 内核预热（首次调用含 JIT 编译，移出计时区间）
+        _calib0 = demo_dataset.get_calib(sample_ids[0])
+        _shape0 = demo_dataset.get_image_shape(sample_ids[0])
+        fov_filter_fused(np.zeros((4, 4), dtype=np.float32), _calib0, _shape0)
+    except Exception:
+        pass
 
     if args.save_preds:
         out_dir = Path(args.save_preds)
@@ -244,7 +259,8 @@ def main():
         if not args.no_fov and cfg.DATA_CONFIG.FOV_POINTS_ONLY:
             try:
                 calib = demo_dataset.get_calib(fid)
-                img_shape = demo_dataset.get_image_shape(fid)
+                # 用 PNG 头解析替代 io.imread（~0.2ms vs ~49ms），尺寸逐帧一致
+                img_shape = _fast_image_shape(demo_dataset.root_split_path, fid)
                 fov_flag = fov_filter_fused(points, calib, img_shape)
                 points = points[fov_flag]
             except Exception:

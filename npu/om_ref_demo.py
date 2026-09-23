@@ -41,6 +41,45 @@ from pcdet.models.model_utils import model_nms_utils
 from pcdet.utils import common_utils
 NUM_ANCHORS = 321408  # 216 * 248 * 2(rot) * 3(class)
 
+try:
+    import numba
+    _HAS_NUMBA = True
+except ImportError:
+    numba = None
+    _HAS_NUMBA = False
+
+
+if _HAS_NUMBA:
+    @numba.jit(nopython=True, cache=True)
+    def _fov_filter_numba(pts, a, p2, p2_c, p2_t32, img_w, img_h):
+        """FOV 投影 + 过滤单内核（逐点保持与 fov_filter_fused/_mm3 同乘加顺序）。
+
+        与 get_fov_flag 同数学：
+          pts_rect = pts @ A[:3] + A[3]   （A = V2C.T @ R0.T）
+          pts_2d   = pts_rect @ P2[:,:3].T + P2[:,3]
+          pts_img  = pts_2d[:,:2] / pts_rect[:,2] ；depth = pts_2d[:,2] - P2.T[3,2]
+        逐元素的乘加链顺序与列式 _mm3 完全一致，故 mask 与 numpy 版逐位相同。
+        """
+        n = pts.shape[0]
+        out = np.empty(n, dtype=np.bool_)
+        for i in range(n):
+            px = pts[i, 0]
+            py = pts[i, 1]
+            pz = pts[i, 2]
+            # _mm3(pts, a[:3]) + a[3]
+            xr = (px * a[0, 0] + py * a[1, 0] + pz * a[2, 0]) + a[3, 0]
+            yr = (px * a[0, 1] + py * a[1, 1] + pz * a[2, 1]) + a[3, 1]
+            zr = (px * a[0, 2] + py * a[1, 2] + pz * a[2, 2]) + a[3, 2]
+            # _mm3(pts_rect, P2[:,:3].T) + P2[:,3]
+            x2 = (xr * p2[0, 0] + yr * p2[1, 0] + zr * p2[2, 0]) + p2_c[0]
+            y2 = (xr * p2[0, 1] + yr * p2[1, 1] + zr * p2[2, 1]) + p2_c[1]
+            z2 = (xr * p2[0, 2] + yr * p2[1, 2] + zr * p2[2, 2]) + p2_c[2]
+            ui = x2 / zr
+            vi = y2 / zr
+            depth = z2 - p2_t32
+            out[i] = (ui >= 0.0) and (ui < img_w) and (vi >= 0.0) and (vi < img_h) and (depth >= 0.0)
+        return out
+
 
 class DemoDataset(DatasetTemplate):
     """与 tools/demo.py 的 DemoDataset 完全一致：读任意 .bin/.npy 点云做推理。"""
@@ -97,7 +136,7 @@ def _mm3(pts, m):
 
 
 def fov_filter_fused(points, calib, img_shape):
-    """FOV 过滤（去 cart_to_hom 的 hstack + 慢速 np.dot/@）。
+    """FOV 过滤（numba 单内核，与 get_fov_flag 同乘加顺序；无 numba 时回退 _mm3 列式路径）。
 
     与 calib.lidar_to_rect + get_fov_flag 同数学（乘加顺序一致）：
       A = V2C.T @ R0.T (4,3)；pts_rect = points @ A[:3] + A[3]
@@ -107,6 +146,15 @@ def fov_filter_fused(points, calib, img_shape):
     """
     pts = points[:, :3]
     a = calib.V2C.T @ calib.R0.T  # (4, 3)
+    if _HAS_NUMBA:
+        return _fov_filter_numba(
+            np.ascontiguousarray(pts, dtype=np.float32),
+            np.ascontiguousarray(a, dtype=np.float32),
+            np.ascontiguousarray(calib.P2[:, :3].T, dtype=np.float32),
+            np.ascontiguousarray(calib.P2[:, 3], dtype=np.float32),
+            calib.P2.T[3, 2],
+            int(img_shape[1]), int(img_shape[0]),
+        )
     pts_rect = _mm3(pts, a[:3]) + a[3]  # (N, 3)
     pts_2d = _mm3(pts_rect, calib.P2[:, :3].T) + calib.P2[:, 3]  # (N, 3)
     pts_img = pts_2d[:, :2] / pts_rect[:, 2:3]
@@ -128,21 +176,42 @@ def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
     return torch.from_numpy(index_map)
 
 
+# 模块级 pad 缓冲复用（按 (m_target, *shape) 缓存，避免每帧 torch.cat + new_zeros 重分配）。
+# 注意：返回的 tensor 与下一帧共享底层缓冲，调用方须在下一帧 pad 前完成消费（现有调用点均满足）。
+_PAD_BUFS = {}
+
+
 def pad_to_static_m(voxels, voxel_num_points, voxel_coords, m_target):
     """把非空 pillar 张量 pad 到静态 OM 的固定 M（P0）。
 
     pad 行 num_points=0 → VFE 掩码掉、特征恒 0；Gather 索引表只引用真实行，
     空网格单元指向 pad 行（零特征）。与动态版输出 bit 一致（见 pointpillar_scatter 的
     bev_index_map Gather 路径）。返回 (voxels, num_points, coords, index_map)。
+
+    缓冲复用：pad 目标固定时复用模块级预分配缓冲（原地清零 + 拷贝），
+    输出数值与 torch.cat 版逐位一致。
     """
     M = voxels.shape[0]
     if M > m_target:
         raise ValueError("M=%d > 静态 OM M=%d，超出范围" % (M, m_target))
     if M < m_target:
-        pad = m_target - M
-        voxels = torch.cat([voxels, voxels.new_zeros(pad, *voxels.shape[1:])], dim=0)
-        voxel_num_points = torch.cat([voxel_num_points, voxel_num_points.new_zeros(pad)], dim=0)
-        voxel_coords = torch.cat([voxel_coords, voxel_coords.new_zeros(pad, voxel_coords.shape[1])], dim=0)
+        key = (m_target, *tuple(voxels.shape[1:]), voxel_coords.shape[1])
+        bufs = _PAD_BUFS.get(key)
+        if bufs is None:
+            bufs = (
+                torch.zeros((m_target, *voxels.shape[1:]), dtype=voxels.dtype),
+                torch.zeros((m_target,), dtype=voxel_num_points.dtype),
+                torch.zeros((m_target, voxel_coords.shape[1]), dtype=voxel_coords.dtype),
+            )
+            _PAD_BUFS[key] = bufs
+        bv, bn, bc = bufs
+        bv.zero_()
+        bv[:M] = voxels
+        bn.zero_()
+        bn[:M] = voxel_num_points
+        bc.zero_()
+        bc[:M] = voxel_coords
+        voxels, voxel_num_points, voxel_coords = bv, bn, bc
     # 索引表只由真实行（前 M 个）构造，pad 值 = m_target
     index_map = build_index_map(voxel_coords[:M], M=M, pad=m_target)
     return voxels, voxel_num_points, voxel_coords, index_map
