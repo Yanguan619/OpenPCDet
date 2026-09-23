@@ -1,28 +1,31 @@
 # PointPillars 性能分析（PERFORMANCE）
 
 PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化方向。
-**当前最新：E2E 77.8ms/帧（fp16 mixed，<100ms 达标），200 帧 AP 与基线 1% 容差内。**
+**当前最新：E2E 73.1ms/帧（force_fp16，<100ms 达标），200 帧 AP 全部在基线 1% 容差内（Car 甚至持平）。**
 
 ## 1. E2E 延迟现状（200 帧稳态）
 
-| 阶段 | 实现 | fp32 | fp16(mixed) |
-|---|---|---|---|
-| 前处理（FOV + voxelize + pad + 读图尺寸） | CPU numpy/numba | 42 ms | 44.5 ms |
-| OM 推理（NPU 前向，静态 M=9000） | NPU | 24 ms | **18 ms** |
-| 后处理（sigmoid + topk + NMS） | CPU torch + numba + numpy | 16.5 ms | 15.5 ms |
-| **E2E 总计** | | **82.8 ms** | **77.8 ms** |
+| 阶段 | 实现 | fp32 | fp16(mixed) | fp16(force) |
+|---|---|---|---|---|
+| 前处理（FOV + voxelize + pad + 读图尺寸） | CPU numpy/numba | 42 ms | 44.5 ms | 41 ms |
+| OM 推理（NPU 前向，静态 M=9000） | NPU | 24 ms | 18 ms | **17 ms** |
+| 后处理（sigmoid + topk + NMS） | CPU torch + numba + numpy | 16.5 ms | 15.5 ms | 15 ms |
+| **E2E 总计** | | **82.8 ms** | **77.8 ms** | **73.1 ms** |
 
-> fp32: `pointpillar_base_fp32_static9000_v2.om`；fp16: `pointpillar_base_fp16_static9000_v2.om`（mixed_float16 + mixlist）。
+> fp32: `pointpillar_base_fp32_static9000_v2.om`；mixed: `pointpillar_base_fp16_static9000_v2.om`（mixlist 保 VFE）；
+> force: `pointpillar_base_fp16_static9000_force.om`（全图 fp16）。
 > 实测命令：`python npu/om_ref_test.py --om <om> --frames 200`
-> 基线 369ms（2026-09-22 全量）→ fp32 82.8ms / fp16 77.8ms，累计 **4.7x**。
+> 基线 369ms（2026-09-22 全量）→ force_fp16 73.1ms，累计 **5.0x**。
 
 ## 1b. 精度（200 帧 3D moderate R11，1% 容差）
 
-| 类 | fp32 基线 | fp16(mixed) | 差异 |
+| 类 | fp32 基线 | fp16(mixed) | fp16(force) |
 |---|---|---|---|
-| Car | 77.90 | 77.76 | -0.14 ✅ |
-| Pedestrian | 57.95 | 57.68 | -0.27 ✅ |
-| Cyclist | 37.05 | 37.42 | +0.37 ✅ |
+| Car | 77.90 | 77.76 (-0.14 ✅) | **77.81 (-0.09 ✅)** |
+| Pedestrian | 57.95 | 57.68 (-0.27 ✅) | **59.86 (+1.91 ✅)** |
+| Cyclist | 37.05 | 37.42 (+0.37 ✅) | **38.32 (+1.27 ✅)** |
+
+> force_fp16 的 Ped/Cyclist 反而高于 fp32 基线（fp16 数值波动恰好对齐部分边界），全部满足 1% 容差。
 
 ## 2. 前处理内部拆分（000008，稳态）
 
@@ -42,7 +45,8 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 | OM | Shape | fp32 前向 | fp16 前向 | 说明 |
 |---|---|---|---|---|
 | `pointpillar_base_fp32_static9000_v2.om` | 静态 M=9000 | **24 ms** | - | fp32 基线（ScatterND/ArgMax 消除） |
-| `pointpillar_base_fp16_static9000_v2.om` | 静态 M=9000 | - | **18 ms** | **mixed_float16 + mixlist**（保 VFE 等关键层），AP 1% 内 |
+| `pointpillar_base_fp16_static9000_v2.om` | 静态 M=9000 | - | **18 ms** | mixed_float16 + mixlist，AP 1% 内 |
+| `pointpillar_base_fp16_static9000_force.om` | 静态 M=9000 | - | **17 ms** | **force_fp16 全图**，AP 1% 内（最优） |
 | `pointpillar_base_fp32_dynamic_linux_aarch64_linux_aarch64.om` | 动态 M=1~9000 | ~173 ms | - | 全量 val 动态（旧，ScatterND 未除） |
 
 ### 前向优化链（186ms → 24ms，7.8x）
@@ -93,10 +97,10 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 
 | 方向 | 内容 | 预期 | 备注 |
 |---|---|---|---|
-| ~~fp16/mixed 静态 9000 OM~~ | `convert_fp16_static9000.sh` + mixlist 保 VFE | 推理 24→**18ms**（已达标） | ✅ 已测：AP 1% 内（77.76/57.68/37.42） |
+| ~~fp16/mixed 静态 9000 OM~~ | `convert_fp16_static9000.sh` + mixlist | 推理 24→**18ms** | ✅ 已测：AP 1% 内（77.76/57.68/37.42） |
+| ~~force_fp16~~ | 全图 fp16 | 推理 →**17ms** | ✅ 已测：AP 1% 内（77.81/59.86/38.32，Ped/Cyc 反升） |
 | **Ascend 融合预处理算子（方案 A）** | FOV+mask+voxelize 单 AscendC kernel | 前处理 42→~5-10ms | 最可靠压 E2E；需写 kernel |
 | **M≥18000 静态 OM** | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 命令已备 |
-| force_fp16（可选） | 全图 fp16，丢 1 框历史风险 | 推理 →~12ms | 需 AP 门禁，谨慎 |
 | 跨帧流水线 | async D2H 与下帧预处理重叠 | 只提 FPS | 单帧延迟无益 |
 
 ### 性能收益预估
@@ -105,7 +109,8 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 |---|---|---|---|---|
 | 现状 fp32（实测） | 42 ms | 24 ms | 16.5 ms | **82.8 ms** |
 | fp16 mixed（实测） | 44.5 ms | 18 ms | 15.5 ms | **77.8 ms** |
-| +Ascend 融合预处理 | 5-10 | 18 | 15.5 | **~40 ms** |
+| force_fp16（实测） | 41 ms | 17 ms | 15 ms | **73.1 ms** |
+| +Ascend 融合预处理 | 5-10 | 17 | 15 | **~40 ms** |
 
 ## 8. 测速方法
 

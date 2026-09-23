@@ -34,22 +34,26 @@ SOC="Ascend310P3"
 # -------------------------------------------------------------
 # 1) fp16 静态 M=9000（demo / 200 帧 AP 验证用）
 #    - precision_mode_v2=mixed_float16 + modify_mixlist: white-list 指定可降
-#      fp16 的算子，其余（含 VFE Mul/BN）保 fp32（历史 15.7ms mixed_optimized 同法，
-#      CHANGELOG: force_fp16 会丢框 24->23，必须 mixlist 保 VFE Mul）
-#    - 可选尝试（若 mixed 仍 >14ms）：force_fp16（不保证精度，需重跑 AP 门禁）
+#      fp16 的算子，其余（含 VFE Mul/BN）保 fp32。
+#    - ✅ 已验证（2026-09-23）：force_fp16 全图在 200 帧 AP 门禁全部 1% 容差内
+#      （Car 77.81 / Ped 59.86 / Cyc 38.32，Ped/Cyc 反升），且比 mixed 更快（17 vs 18ms）
+#      → force_fp16 为当前最优交付。
 # -------------------------------------------------------------
 "$ATC" --model="$ONNX" --framework=5 \
     --soc_version="$SOC" \
-    --output="weights/pointpillar_base_fp16_static9000_v2" \
+    --output="weights/pointpillar_base_fp16_static9000_force" \
     --input_format=ND \
-    --precision_mode_v2=mixed_float16 \
-    --modify_mixlist="$MIXLIST" \
+    --precision_mode=force_fp16 \
     --input_shape="voxels:9000,32,4;voxel_num_points:9000;voxel_coords:9000,4;bev_index_map:214272"
 
-# 备选（精度风险自担，仅对比测速用，勿做最终交付）:
+# 备选 mixed（VFE 等保 fp32，若 force 精度不达标再用）:
 # "$ATC" --model="$ONNX" --framework=5 \
 #     --soc_version="$SOC" \
-#     --output="weights/pointpillar_base_fp16_static9000_force.om" \
+#     --output="weights/pointpillar_base_fp16_static9000_v2" \
+#     --input_format=ND \
+#     --precision_mode_v2=mixed_float16 \
+#     --modify_mixlist="$MIXLIST" \
+#     --input_shape="voxels:9000,32,4;voxel_num_points:9000;voxel_coords:9000,4;bev_index_map:214272"
 #     --input_format=ND \
 #     --precision_mode=force_fp16 \
 #     --input_shape="voxels:9000,32,4;voxel_num_points:9000;voxel_coords:9000,4;bev_index_map:214272"

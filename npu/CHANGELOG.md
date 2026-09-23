@@ -122,9 +122,20 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --fr
 ### ✅ fp16/mixed 实测（2026-09-23）
 
 - `weights/pointpillar_base_fp16_static9000_v2.om`（mixed_float16 + `weights/mix_fp16_static9000.json`，VFE 等关键层保 fp32）。
-- 前向 **24 → 18ms**（mixlist 保关键层，未达 force_fp16 的 ~12ms，但精度稳）；E2E 82.8 → **77.8ms/帧**。
+- 前向 **24 → 18ms**（mixlist 保关键层）；E2E 82.8 → **77.8ms/帧**。
 - 200 帧 AP：**Car 77.76 / Ped 57.68 / Cyc 37.42**（fp32 基线 77.90/57.95/37.05，全部 1% 容差内 ✅）。
 - 000008 检测 33 框 vs fp32 34 框（1 个低置信边界框被 fp16 变化吞掉，AP 无感）。
+- **加白名单 Conv2D/Relu/Transpose/TransData（mix v2）无提速**（前向仍 18ms）：
+  Conv2DTransposeD 已 fp16（7330→4234us），Conv2D 内存受限（3560→3335us，fp16 无益）；
+  剩余 GatherV2/Transpose/TransData 为搬运瓶颈 → **fp16 空间已用尽**。
+
+### ✅ force_fp16 实测（2026-09-23）——当前最优
+
+- `weights/pointpillar_base_fp16_static9000_force.om`（`--precision_mode=force_fp16` 全图）。
+- 前向 **17ms**，E2E **73.1ms/帧**（基线 369ms → **5.0x**）。
+- 200 帧 AP：**Car 77.81 / Ped 59.86 / Cyc 38.32**（全部 1% 容差内 ✅；**Ped/Cyc 反升**，
+  修正旧结论"force_fp16 必丢框"——旧记录针对带 ScatterND/ArgMax 的旧 onnx，当前 noscatter_noargmax base 无此问题）。
+- `npu/convert_fp16_static9000.sh` 已把 force_fp16 升为主交付选项。
 
 **合并后 200 帧官方评测（R11 3D moderate）**：**Car 77.90 / Ped 57.95 / Cyc 37.05** —— 与基线**完全一致**（bit 级精度保持）。
 **E2E：82.8ms/帧**（前处理 42 + 推理 24 + 后处理 16.5），基线 369ms → **4.5x**，**达成 <100ms 目标**。
