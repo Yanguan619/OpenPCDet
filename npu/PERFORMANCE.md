@@ -17,6 +17,39 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 > 实测命令：`python npu/om_ref_test.py --om <om> --frames 200`
 > 基线 369ms（2026-09-22 全量）→ force_fp16 73.1ms，累计 **5.0x**。
 
+### 1.1 静态 pad-到-18000 fp16 的 E2E 进一步拆分（全量 val 3769 帧）
+
+全量 val 结构（用户机，avg 71.2ms/帧）：**前处理 39.6 + 推理 19.7 + 后处理 11.9**。
+
+本机子环节逐段实测（每帧 avg，弱 CPU，用于相对结构）：
+
+| 子环节 | 本机耗时 | 占比 | 说明 |
+|---|---|---|---|
+| **FOV numba** | 50.9 ms | 37% | 最大 CPU 单项 |
+| 后处理 sigmoid + D2H | 19.8 ms | 14% | 13MB D2H + torch.sigmoid/max |
+| 后处理 NMS（增量） | 23.3 ms | 17% | top-4096 |
+| **推理 forward** | 19.8 ms | 14% | 静态 18000，**总是处理 18000 行** |
+| voxelize numba | 17.8 ms | 13% | |
+| pad→18000 | 4.2 ms | 3% | 每帧 pad |
+| 读 bin | 1.5 ms | 1% | |
+
+> 静态 pad 的**推理浪费**在于：M 平均 ~8000 的帧也处理 18000 行 VFE（推理 19.7ms 固定，与 M 无关）；
+> 前处理 pad 开销仅 4.2ms，不是主因。→ 见 1.2 动态对比。
+
+### 1.2 动态 vs 静态 pad（全量 val 3769 帧，fp16）
+
+| 指标 | 动态 fp16（1~18000） | 静态 18000（pad） |
+|---|---|---|
+| E2E avg | **67.5 ms** | 71.2 ms |
+| 前处理 | 34.5 ms | 39.6 ms（+pad→18000 ~5ms） |
+| 推理 | 21.3 ms | 19.7 ms（省动态调度） |
+| 后处理 | 11.8 ms | 11.9 ms |
+| AP（Car/Ped/Cyc） | 77.07/51.93/61.95 | 77.07/51.93/61.95（相同） |
+
+**结论：动态 OM 更优**（净胜 ~3.5ms）——静态推理虽省 `set_dynamic_shape` 1.6ms，但静态总是处理 18000 行的浪费 + pad 开销反超；
+且静态 pad 与动态预测**逐位一致**（pad 行不参与 scatter），全量 AP 完全相同。
+**全量 val 推荐动态 fp16 om**（`pointpillar_base_fp16_dynamic18000_force_linux_aarch64.om`）。
+
 ## 1b. 精度（200 帧 3D moderate R11，1% 容差）
 
 | 类 | fp32 基线 | fp16(mixed) | fp16(force) |
