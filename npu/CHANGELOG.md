@@ -117,7 +117,14 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --fr
 |---|---|---|---|
 | A 前处理 | numba 体素化核心循环（unum_ops，voxel 全等）+ pad 缓冲复用 + FOV numba 内核（`_fov_filter_numba`）+ PIL 读图尺寸（49ms→0.2ms） | 前处理 113.5→**42ms** | 200帧 AP 与基线完全一致 |
 | B 后处理 | numpy `argpartition` topk + `tensor_to_numpy(copy=False)` 免 13MB memcpy + sigmoid 单调性（`max sigmoid == sigmoid max`） | 后处理 49.5→**16.5ms** | 10 帧 preds 逐位一致 |
-| C fp16 准备 | `npu/convert_fp16_static9000.sh`（mixed_float16 + mixlist 保 VFE）+ M≥17000 全量命令 | （待 ATC 后验证） | - |
+| C fp16 准备 | `npu/convert_fp16_static9000.sh`（mixed_float16 + mixlist 保 VFE）+ M≥17000 全量命令 | ✅ 已转已测：推理 24→**18ms**，AP 1% 内 | - |
+
+### ✅ fp16/mixed 实测（2026-09-23）
+
+- `weights/pointpillar_base_fp16_static9000_v2.om`（mixed_float16 + `weights/mix_fp16_static9000.json`，VFE 等关键层保 fp32）。
+- 前向 **24 → 18ms**（mixlist 保关键层，未达 force_fp16 的 ~12ms，但精度稳）；E2E 82.8 → **77.8ms/帧**。
+- 200 帧 AP：**Car 77.76 / Ped 57.68 / Cyc 37.42**（fp32 基线 77.90/57.95/37.05，全部 1% 容差内 ✅）。
+- 000008 检测 33 框 vs fp32 34 框（1 个低置信边界框被 fp16 变化吞掉，AP 无感）。
 
 **合并后 200 帧官方评测（R11 3D moderate）**：**Car 77.90 / Ped 57.95 / Cyc 37.05** —— 与基线**完全一致**（bit 级精度保持）。
 **E2E：82.8ms/帧**（前处理 42 + 推理 24 + 后处理 16.5），基线 369ms → **4.5x**，**达成 <100ms 目标**。
