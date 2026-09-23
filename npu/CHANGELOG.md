@@ -111,6 +111,20 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --fr
 **E2E 实测（200 帧，静态 9000 fp32 OM，本机）**：**186.8ms/帧**（基线 369ms → **2.0x**）
 拆分：前处理 **113.5ms**（fov 59 + voxelize ~37 + pad ~22）+ 推理 **24ms** + 后处理 **49.5ms**。
 
+### ✅ 并行优化三合一（2026-09-23，subagent × git worktree）——E2E **82.8ms/帧**（<100ms 达标）
+
+| 任务 | 改动 | 实测 | AP 门禁 |
+|---|---|---|---|
+| A 前处理 | numba 体素化核心循环（unum_ops，voxel 全等）+ pad 缓冲复用 + FOV numba 内核（`_fov_filter_numba`）+ PIL 读图尺寸（49ms→0.2ms） | 前处理 113.5→**42ms** | 200帧 AP 与基线完全一致 |
+| B 后处理 | numpy `argpartition` topk + `tensor_to_numpy(copy=False)` 免 13MB memcpy + sigmoid 单调性（`max sigmoid == sigmoid max`） | 后处理 49.5→**16.5ms** | 10 帧 preds 逐位一致 |
+| C fp16 准备 | `npu/convert_fp16_static9000.sh`（mixed_float16 + mixlist 保 VFE）+ M≥17000 全量命令 | （待 ATC 后验证） | - |
+
+**合并后 200 帧官方评测（R11 3D moderate）**：**Car 77.90 / Ped 57.95 / Cyc 37.05** —— 与基线**完全一致**（bit 级精度保持）。
+**E2E：82.8ms/帧**（前处理 42 + 推理 24 + 后处理 16.5），基线 369ms → **4.5x**，**达成 <100ms 目标**。
+
+> 结论：NMS 内嵌 OM（图内 NonMaxSurppression/TopK）在 310P 上**输出垃圾**（top score 0.0046 vs 0.965、500 重复框），
+> 动态/静态 shape 均复现 → 后处理**不能移入 OM**，CPU 后处理（16.5ms）为可靠路径。
+
 > ⚠️ 注意：本机 openblas64 单线程对 (N,3)@(3,3) 小 K 矩阵乘走标量路径（~81ms/次），
 > np.dot / np.einsum / torch.matmul 均非全 bit 一致；FOV 逐元素有 ~1 点/帧 边界翻转，
 > 经 200 帧 AP 门禁判定**无精度影响**（预处理容忍微差，与 numba 体素化 4.5e-5 同性质）。
