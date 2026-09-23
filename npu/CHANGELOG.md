@@ -39,6 +39,36 @@
   227 节点），与 raw 基线 **bit 一致**（onnxruntime max diff=0）。
 - 预期：前向 42.7ms → ~25ms（ArgMaxD 19.4ms 消除）。
 
+### ✅ P3 已就绪（2026-09-23）：fp16/mixed 静态 OM 转换脚本 + mixlist（推理 24 → ~12ms）
+
+当前 fp32 静态 9000 OM 推理 **24ms**（200 帧 E2E 拆分，见上）。目标用 fp16/mixed 静态 OM
+把推理降到 **~12ms**（精度容差 1% AP：Car 77.90 / Ped 57.95 / Cyc 37.05，3D moderate R11）。
+
+- **产物（仅脚本 + mixlist，不在本机跑 ATC）**：
+  - `npu/convert_fp16_static9000.sh`：生成 fp16/mixed 静态 OM + 全量 val 用 M≥17000 静态 OM 的命令。
+  - `npu/mix_fp16_static9000.json`：white-list mixlist（参考老 mixed_optimized），脚本启动时
+    `cp` 到 `weights/mix_fp16_static9000.json`（`weights` 是共享 symlink、不入 git，故 canonical 放 `npu/`）。
+- **fp16 命令要点**（`weights/pointpillar_base_fp16_static9000_v2.om`，M=9000 静态）：
+  ```
+  atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --framework=5 \
+      --soc_version=Ascend310P3 --output=weights/pointpillar_base_fp16_static9000_v2 \
+      --input_format=ND --precision_mode_v2=mixed_float16 \
+      --modify_mixlist=weights/mix_fp16_static9000.json \
+      --input_shape="voxels:9000,32,4;voxel_num_points:9000;voxel_coords:9000,4;bev_index_map:214272"
+  ```
+- **mixlist 内容**（`white-list.to-add`，复用历史 15.7ms mixed_optimized 名单，
+  VFE 关键 Mul/BN 不在名单内 → 保持 fp32，避免 force_fp16 丢框 24→23）：
+  `StridedSliceD / ReduceSumD / ConcatD / GatherV2 / ConfusionTransposeD / AutomaticBufferFusionOp`
+- **全量 val 用 M≥17000 静态 OM**（抽样 54% 帧 M>9000，最大 ~16664）：`pointpillar_base_fp32_static18000`
+  （force_fp32，不动精度）+ `pointpillar_base_fp16_static18000`（mixed_float16 + 同 mixlist），
+  `--input_shape="voxels:18000,32,4;voxel_num_points:18000;voxel_coords:18000,4;bev_index_map:214272"`。
+- **验证命令**（在性能好的机器上）：
+  `python npu/om_ref_test.py --om weights/pointpillar_base_fp16_static9000_v2.om --frames 200`
+  全量 val：`python npu/om_ref_test.py --om weights/pointpillar_base_fp16_static18000.om`。
+  门禁：3D moderate R11 三类与 fp32 基线差 ≤ ±1 AP。
+
+> 备选：`--precision_mode=force_fp16` 更快但不保证精度（历史 24→23 丢框），仅对比测速用，不交付。
+
 ### 静态 OM（P0）待用户在大机器转换（noscatter onnx 已就绪）
 
 ```
