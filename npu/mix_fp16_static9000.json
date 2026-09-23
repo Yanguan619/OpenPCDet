@@ -1,0 +1,12 @@
+{
+  "white-list": {
+    "to-add": [
+      "StridedSliceD",
+      "ReduceSumD",
+      "ConcatD",
+      "GatherV2",
+      "ConfusionTransposeD",
+      "AutomaticBufferFusionOp"
+    ]
+  }
+}
