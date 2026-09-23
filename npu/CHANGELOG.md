@@ -125,6 +125,23 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --fr
 > 结论：NMS 内嵌 OM（图内 NonMaxSurppression/TopK）在 310P 上**输出垃圾**（top score 0.0046 vs 0.965、500 重复框），
 > 动态/静态 shape 均复现 → 后处理**不能移入 OM**，CPU 后处理（16.5ms）为可靠路径。
 
+#### NMS-in-OM 精确根因链（2026-09-23 复检，修正结论）
+
+对照 `cann/ops-cv` 的 `non_max_suppression_v6`（其 README 明确：**该目录仅开源 aclnn host 接口，Ascend C kernel 闭源**，
+最近提交记录了入参约束），定位到**两层代码级原因**：
+
+1. **框数硬限制（已证实，修复有效）**：`aclnnNonMaxSuppression` 约束**每 batch 框数 ≤ 50000**。
+   PointPillar NMS 输入 321408 anchors 远超限制 → 输出**完全垃圾**（全 0 索引、重复框、score ~0.005）。
+   → `export_onnx.py` 图手术加 **pre-TopK(4096)** 后：**选择完全正确**（top5 score 0.9654/0.95/0.9284…、框 14.75/-1.07 等）。
+2. **IoU 抑制失效（310P kernel 缺陷，无法绕过）**：框数合规后，NPU NonMaxSuppression **返回全部 max_out=500 框、无 IoU 抑制**
+   （487 个 Car 重叠重复 vs CPU onnxruntime 正确 32 框）。即该算子 kernel 在 310P 上 IoU 计算失效；
+   ops-cv 只开源 aclnn 接口，kernel 闭源且行为错误，无法修复。
+   最小 NMS om（常量输入）同样执行失败。
+
+**量化收益判断（即便抑制正常也不划算）**：图内 sigmoid+TopK+NMS 使前向 24ms → **47ms**（图内对 321408 做 sigmoid/topk 本身就贵），
+加 ~2ms 后处理 ≈ 49ms，**劣于** base om 24ms + CPU 后处理 16.5ms = 40.5ms。→ **NMS 融合 OM 在此硬件上不可行且无收益**。
+可行折中（如需减 D2H）：sigmoid+TopK 放图内输出 top-4096（~140KB vs 13MB），IoU NMS 留 Python。
+
 > ⚠️ 注意：本机 openblas64 单线程对 (N,3)@(3,3) 小 K 矩阵乘走标量路径（~81ms/次），
 > np.dot / np.einsum / torch.matmul 均非全 bit 一致；FOV 逐元素有 ~1 点/帧 边界翻转，
 > 经 200 帧 AP 门禁判定**无精度影响**（预处理容忍微差，与 numba 体素化 4.5e-5 同性质）。

@@ -258,15 +258,32 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
     add(helper.make_node("Cast", [labels_1d], [labels_i64],
                          to=TensorProto.INT64, name=labels_i64))
 
-    # ---------- Unsqueeze scores to (1,1,N) for NMS ----------
-    # 两次 Unsqueeze: (N,) -> (1,N) -> (1,1,N)
+    # ---------- Pre-TopK: 把 NMS 输入框数压到 <=50000 ----------
+    # aclnnNonMaxSuppression 硬限制：每 batch 框数 <= 50000（PointPillar 321408 直接超限 → 输出垃圾）。
+    # 先按分数 TopK 选 top-k（对齐 Python 侧 score-mask + topk(NMS_PRE_MAXSIZE)），再进 NMS。
+    topk_k = getattr(args, "pre_topk", 4096)
+    topk_vals = prefix + "topk_vals"
+    topk_idx = prefix + "topk_idx"
+    ensure_vi(topk_vals, [topk_k])
+    ensure_vi(topk_idx, [topk_k], TensorProto.INT64)
+    add(make_const(prefix + "topk_k", np.array([topk_k], dtype=np.int64)))
+    add(helper.make_node("TopK", [scores_1d, prefix + "topk_k"],
+                         [topk_vals, topk_idx],
+                         axis=0, largest=1, sorted=1, name=topk_vals))
+
+    labels_top = prefix + "labels_top"
+    ensure_vi(labels_top, [topk_k], TensorProto.INT64)
+    add(helper.make_node("Gather", [labels_i64, topk_idx], [labels_top],
+                         axis=0, name=labels_top))
+
+    # ---------- Unsqueeze top scores to (1,1,K) for NMS ----------
     scores_nms_mid = prefix + "scores_nms_mid"
-    ensure_vi(scores_nms_mid, [1, NUM_ANCHORS])
+    ensure_vi(scores_nms_mid, [1, topk_k])
     add(make_const(prefix + "ax0", np.array([0], dtype=np.int64)))
-    add(helper.make_node("Unsqueeze", [scores_1d, prefix + "ax0"], [scores_nms_mid], name=scores_nms_mid))
+    add(helper.make_node("Unsqueeze", [topk_vals, prefix + "ax0"], [scores_nms_mid], name=scores_nms_mid))
 
     scores_nms = prefix + "scores_nms"
-    ensure_vi(scores_nms, [1, 1, NUM_ANCHORS])
+    ensure_vi(scores_nms, [1, 1, topk_k])
     add(helper.make_node("Unsqueeze", [scores_nms_mid, prefix + "ax0"], [scores_nms], name=scores_nms))
 
     # ---------- Convert 3D box [x,y,z,dx,dy,dz,r] to 2D BEV [x1,y1,x2,y2] ----------
@@ -330,6 +347,12 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
     add(helper.make_node("Concat", [x1, y1, x2, y2], [boxes_2d],
                          axis=2, name=boxes_2d))
 
+    # ---------- 用 top-k 的 BEV 框进 NMS ----------
+    boxes_2d_top = prefix + "boxes_2d_top"
+    ensure_vi(boxes_2d_top, [1, topk_k, 4])
+    add(helper.make_node("Gather", [boxes_2d, topk_idx], [boxes_2d_top],
+                         axis=1, name=boxes_2d_top))
+
     # ---------- NonMaxSuppression ----------
     max_out = prefix + "max_out"
     ensure_vi(max_out, [1], TensorProto.INT64)
@@ -348,12 +371,11 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
     out_shape = [None, 3]  # dynamic
     ensure_vi(sel, out_shape, TensorProto.INT64)
     add(helper.make_node("NonMaxSuppression",
-                         [boxes_2d, scores_nms, max_out, iou_thr, score_thr],
+                         [boxes_2d_top, scores_nms, max_out, iou_thr, score_thr],
                          [sel], name=sel))
 
     # ---------- Squeeze batch & class dims: (num, 3) -> (num,) ----------
-    # sel: [batch_id, class_id, box_id] -> take column 2 (box_id)
-    # Slice(sel, starts=[0,2], ends=[maxsize,3], axes=[0,1]) -> box_ids (num,1)
+    # sel: [batch_id, class_id, box_id] -> take column 2 (box_id)（相对 top-k）
     box_ids = prefix + "box_ids"
     ensure_vi(box_ids, [None, 1], TensorProto.INT64)
     c_starts = prefix + "sel_starts"
@@ -372,21 +394,27 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
     add(make_const(prefix + "axes_1", np.array([1], dtype=np.int64)))
     add(helper.make_node("Squeeze", [box_ids, prefix + "axes_1"], [box_ids_1d], name=box_ids_1d))
 
+    # ---------- 把 top-k 索引映射回原始 anchor 索引 ----------
+    orig_ids_1d = prefix + "orig_ids_1d"
+    ensure_vi(orig_ids_1d, [None], TensorProto.INT64)
+    add(helper.make_node("Gather", [topk_idx, box_ids_1d], [orig_ids_1d],
+                         axis=0, name=orig_ids_1d))
+
     # ---------- Gather final boxes, scores, labels ----------
-    # final_boxes = Gather(BOX, box_ids_1d, axis=1)
+    # final_boxes = Gather(BOX, orig_ids_1d, axis=1)
     final_boxes = prefix + "final_boxes"
     ensure_vi(final_boxes, [1, None, 7])
-    add(helper.make_node("Gather", [BOX, box_ids_1d], [final_boxes],
+    add(helper.make_node("Gather", [BOX, orig_ids_1d], [final_boxes],
                          axis=1, name=final_boxes))
 
     final_scores = prefix + "final_scores"
     ensure_vi(final_scores, [None])
-    add(helper.make_node("Gather", [scores_1d, box_ids_1d], [final_scores],
+    add(helper.make_node("Gather", [topk_vals, box_ids_1d], [final_scores],
                          axis=0, name=final_scores))
 
     final_labels = prefix + "final_labels"
     ensure_vi(final_labels, [None], TensorProto.INT64)
-    add(helper.make_node("Gather", [labels_i64, box_ids_1d], [final_labels],
+    add(helper.make_node("Gather", [labels_top, box_ids_1d], [final_labels],
                          axis=0, name=final_labels))
 
     final_count = prefix + "final_count"
