@@ -470,6 +470,7 @@ def main():
                         help="只做 sigmoid-等价的 ReduceMax + TopK + Gather（不叠加 NMS），"
                              "输出 top-K box/cls，后处理（NMS）留 Python（P2 方案，D2H 13MB->~160KB）")
     parser.add_argument("--topk-k", type=int, default=4096, help="topk-only 的 K（须 <=50000）")
+    parser.add_argument("--fold-bn", action="store_true", help="把 BatchNormalization 折叠进 Conv/ConvTranspose（数学精确，提速前向）")
     parser.add_argument("--score-thresh", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.01)
     parser.add_argument("--max-det", type=int, default=500)
@@ -483,6 +484,10 @@ def main():
         print("===== Step 1: 导出 base ONNX =====", flush=True)
         export_base_onnx(base_path, args)
 
+    if getattr(args, "fold_bn", False):
+        print("===== Step 1.5: BN 折叠进 Conv/ConvTranspose =====", flush=True)
+        fold_bn_into_conv(base_path)
+
     if getattr(args, "topk_only", False):
         print("===== Step 2: 图手术 - topk-only（无 NMS）=====", flush=True)
         add_topk_only(base_path, final_path, args)
@@ -492,6 +497,105 @@ def main():
 
     print("\n完成! 后续 ATC 转换:", flush=True)
     print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 --output=weights/pointpillar_nms --input_format=ND" % final_path, flush=True)
+
+
+def fold_bn_into_conv(onnx_path):
+    """把 BatchNormalization 折叠进其前驱 Conv/ConvTranspose（数学精确）。
+
+    y = (x - μ)/sqrt(σ²+ε) * γ + β = x * A + C，其中 A = γ/sqrt(σ²+ε)，C = β - μ*A。
+    对 Conv：W' = W*A[out_c]，b' = b*A[out_c] + C[out_c]；无 bias 则新建。
+    对 ConvTranspose：输出通道在 weight 的 dim1。
+    """
+    import onnx as _onnx
+    from onnx import numpy_helper as _nh
+
+    model = _onnx.load(onnx_path)
+    g = model.graph
+    consts = {c.name: _nh.to_array(c) for c in g.initializer}
+    prods = {o: n for n in g.node for o in n.output}
+
+    def get_arr(name):
+        if name in consts:
+            return consts[name], True
+        n = prods.get(name)
+        if n is not None and n.op_type == "Constant":
+            for a in n.attribute:
+                if a.name == "value":
+                    return _nh.to_array(a.t), True
+        return None, False
+
+    nodes = list(g.node)
+    new_nodes = []
+    removed = set()
+    n_folded = 0
+    for bn in nodes:
+        if bn.op_type != "BatchNormalization":
+            continue
+        prev = prods.get(bn.input[0])
+        if prev is None or prev.op_type not in ("Conv", "ConvTranspose"):
+            continue
+        scale, ok1 = get_arr(bn.input[1])
+        b, ok2 = get_arr(bn.input[2])
+        mean, ok3 = get_arr(bn.input[3])
+        var, ok4 = get_arr(bn.input[4])
+        if not (ok1 and ok2 and ok3 and ok4):
+            continue
+        eps = 1e-5
+        for a in bn.attribute:
+            if a.name == "epsilon":
+                eps = a.f
+        A = scale / np.sqrt(var + eps)
+        C = b - mean * A
+        # 找 Conv 的 weight/bias（可能是 input 或 initializer）
+        w_name = prev.input[1]
+        w, w_is_const = get_arr(w_name)
+        if not w_is_const:
+            continue
+        n_out = w.shape[0] if prev.op_type == "Conv" else w.shape[1]
+        A_r = A.reshape([n_out] + [1] * (w.ndim - 1)) if prev.op_type == "Conv" \
+            else A.reshape([1, n_out] + [1] * (w.ndim - 2))
+        w_new = w * A_r
+        # 更新/新建 initializer
+        new_w = _nh.from_array(np.ascontiguousarray(w_new), w_name)
+        found = False
+        for i, c in enumerate(g.initializer):
+            if c.name == w_name:
+                del g.initializer[i]
+                g.initializer.insert(i, new_w)
+                found = True
+                break
+        if not found:
+            g.initializer.append(new_w)
+        # bias: 若有则 b*A+C，否则新建 C
+        if len(prev.input) > 2 and prev.input[2]:
+            bname = prev.input[2]
+            b_old, b_ok = get_arr(bname)
+            if b_ok:
+                b_new = b_old * A + C
+                nb = _nh.from_array(np.ascontiguousarray(b_new.astype(w_new.dtype)), bname)
+                for i, c in enumerate(g.initializer):
+                    if c.name == bname:
+                        del g.initializer[i]
+                        g.initializer.insert(i, nb)
+                        found = True
+                        break
+        else:
+            bname = bn.name + "/fused_bias"
+            nb = _nh.from_array(np.ascontiguousarray(C.astype(np.float32)), bname)
+            g.initializer.append(nb)
+            prev.input.append(bname)
+        # 重连：BN 输出 -> Conv 输出
+        bn_out = bn.output[0]
+        prev.output[0] = bn_out
+        removed.add(id(bn))
+        n_folded += 1
+        print("  fold BN %s -> %s(%s)" % (bn.name, prev.op_type, prev.name), flush=True)
+
+    g.ClearField("node")
+    g.node.extend([n for n in nodes if id(n) not in removed])
+    _onnx.checker.check_model(model)
+    _onnx.save(model, onnx_path)
+    print("BN 折叠完成: %d -> 0 个 BN（%s）" % (n_folded, onnx_path), flush=True)
 
 
 def add_topk_only(base_onnx_path, final_onnx_path, args):
