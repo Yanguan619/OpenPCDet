@@ -554,8 +554,8 @@ def main():
         print('OM inference time: {:.4f}s'.format(time.time() - time_start))
 
         if base_mode:
-            om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, NUM_ANCHORS, 7)
-            om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, NUM_ANCHORS, 3)
+            om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, -1, 7)
+            om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, -1, 3)
             # sigmoid 单调递增：max(sigmoid(x)) == sigmoid(max(x))，先取类间 max 再 sigmoid（省 2/3 逐元素）
             cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
             label = label + 1

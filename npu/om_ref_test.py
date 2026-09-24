@@ -306,8 +306,8 @@ def main():
 
         # ---------------- 后处理 ----------------
         t_c = time.perf_counter()
-        om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, NUM_ANCHORS, 7)
-        om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, NUM_ANCHORS, 3)
+        om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, -1, 7)
+        om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, -1, 3)
         cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
         label = label + 1
         scores = torch.sigmoid(cls_max)

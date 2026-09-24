@@ -466,6 +466,10 @@ def main():
     parser.add_argument("--base-output", default=str(ROOT / "weights/pointpillar_nms_base.onnx"))
     parser.add_argument("--skip-export", action="store_true", help="复用已有 base ONNX，只做图手术")
     parser.add_argument("--dynamic", action="store_true", help="导出时把 voxels 的 M 维度标为动态")
+    parser.add_argument("--topk-only", action="store_true",
+                        help="只做 sigmoid-等价的 ReduceMax + TopK + Gather（不叠加 NMS），"
+                             "输出 top-K box/cls，后处理（NMS）留 Python（P2 方案，D2H 13MB->~160KB）")
+    parser.add_argument("--topk-k", type=int, default=4096, help="topk-only 的 K（须 <=50000）")
     parser.add_argument("--score-thresh", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.01)
     parser.add_argument("--max-det", type=int, default=500)
@@ -479,11 +483,65 @@ def main():
         print("===== Step 1: 导出 base ONNX =====", flush=True)
         export_base_onnx(base_path, args)
 
-    print("===== Step 2: 图手术 - 追加后处理 =====", flush=True)
-    add_postproc(base_path, final_path, args)
+    if getattr(args, "topk_only", False):
+        print("===== Step 2: 图手术 - topk-only（无 NMS）=====", flush=True)
+        add_topk_only(base_path, final_path, args)
+    else:
+        print("===== Step 2: 图手术 - 追加后处理 =====", flush=True)
+        add_postproc(base_path, final_path, args)
 
     print("\n完成! 后续 ATC 转换:", flush=True)
     print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 --output=weights/pointpillar_nms --input_format=ND" % final_path, flush=True)
+
+
+def add_topk_only(base_onnx_path, final_onnx_path, args):
+    """P2：只加 sigmoid-等价的 ReduceMax + TopK + Gather（**无 NMS**）。
+
+    图内: ReduceMax(cls,axis=2)->(1,N)；Squeeze->(N,)；TopK(k)->vals/idx；
+    Gather(boxes, idx, axis=1)->(1,K,7)；Gather(cls, idx, axis=1)->(1,K,3)。
+    输出 top-K box + raw cls（D2H ~160KB vs 13MB）；类别标签与 NMS 留在 CPU。
+
+    - 不叠加 ArgMax（310P ArgMaxD ~19ms 慢）；TopK 本身 ~0.4ms（实测）。
+    - K 必须 <=50000（aclnnNonMaxSuppression 硬限制，这里无 NMS 但仍保守）。
+    """
+    import onnx as _onnx
+    from onnx import helper as _h, TensorProto as _T
+
+    model = _onnx.load(base_onnx_path)
+    g = model.graph
+    nodes = list(g.node)
+    base_out = [o.name for o in g.output]
+    if len(base_out) != 2:
+        raise RuntimeError("期望 2 个 base 输出, 实际 %d" % len(base_out))
+    box, cls = base_out[0], base_out[1]
+    k = getattr(args, "topk_k", 4096)
+
+    def add(n):
+        nodes.append(n)
+
+    scores = "topk_scores"
+    add(_h.make_node("ReduceMax", [cls], [scores], axes=[2], keepdims=0, name="topk_reducemax"))
+    scores1 = "topk_scores_1d"
+    ax = _h.make_tensor("topk_sq_ax", _T.INT64, [1], np.array([0], np.int64))
+    g.initializer.append(ax)
+    add(_h.make_node("Squeeze", [scores, "topk_sq_ax"], [scores1], name="topk_squeeze"))
+    tv, ti = "topk_vals", "topk_idx"
+    kk = _h.make_tensor("topk_k", _T.INT64, [1], np.array([k], np.int64))
+    g.initializer.append(kk)
+    add(_h.make_node("TopK", [scores1, "topk_k"], [tv, ti], axis=0, largest=1, sorted=1, name="topk_topk"))
+    tb, tc = "topk_boxes", "topk_cls"
+    add(_h.make_node("Gather", [box, ti], [tb], axis=1, name="topk_gather_box"))
+    add(_h.make_node("Gather", [cls, ti], [tc], axis=1, name="topk_gather_cls"))
+    del g.output[:]
+    g.output.extend([
+        _h.make_tensor_value_info(tb, _T.FLOAT, [1, k, 7]),
+        _h.make_tensor_value_info(tc, _T.FLOAT, [1, k, 3]),
+    ])
+    g.ClearField("node")
+    g.node.extend(nodes)
+    _onnx.checker.check_model(model)
+    _onnx.save(model, final_onnx_path)
+    print("topk-only ONNX -> %s  (K=%d)" % (final_onnx_path, k), flush=True)
 
 
 if __name__ == "__main__":
