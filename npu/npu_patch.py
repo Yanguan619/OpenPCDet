@@ -24,6 +24,21 @@ import numba
 import numpy as np
 import torch
 
+
+def _alias_spconv():
+    """将 spconv / spconv.utils 别名到 unum_ops 的 spconv shim（sys.modules 注入）。
+
+    使 `from spconv.utils import VoxelGeneratorV2` 无需仓库根目录的 spconv 符号链接，
+    任何机器（含无 unum_ops 相邻部署）都能通过本补丁解析。必须在 import pcdet 之前调用。
+    """
+    try:
+        import unum_ops.spconv
+        import unum_ops.spconv.utils
+    except ImportError:
+        return
+    sys.modules.setdefault('spconv', sys.modules['unum_ops.spconv'])
+    sys.modules.setdefault('spconv.utils', sys.modules['unum_ops.spconv.utils'])
+
 _F32 = np.float32
 
 
@@ -645,6 +660,7 @@ def init_patch(jit_compile=False):
         torch.npu.set_compile_mode(jit_compile=jit_compile)
     if device != "cuda":
         patch_rotate_iou()
+    _alias_spconv()
     return device
 
 
