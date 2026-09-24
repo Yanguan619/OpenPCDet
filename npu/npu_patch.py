@@ -12,6 +12,7 @@
 """
 
 import math
+import os
 import sys
 import types
 from pathlib import Path
@@ -38,6 +39,43 @@ def _alias_spconv():
         return
     sys.modules.setdefault('spconv', sys.modules['unum_ops.spconv'])
     sys.modules.setdefault('spconv.utils', sys.modules['unum_ops.spconv.utils'])
+
+
+def _patch_voxelize_ascendc():
+    """将 VoxelGeneratorV2.generate 路由到 unum_ops 的 AscendC 硬体素化（NPU kernel）。
+
+    输出与 CPU numba 版逐位一致（voxels/npp/coords 已验证 2306/2306），仅 coords 序
+    为 (x,y,z) → 转回 spconv 的 (z,y,x)。全量点（demo 无 FOV）~2x 快，FOV 后小输入
+    持平。任何异常自动回退 CPU 原路径。可用环境变量 NPU_ASCENDC_VOXELIZE=0 关闭。
+    """
+    if os.environ.get('NPU_ASCENDC_VOXELIZE', '1') != '1':
+        return
+    try:
+        from unum_ops.voxelization.voxelization_ascendc_v2 import voxelization
+        from unum_ops.spconv.utils import VoxelGeneratorV2
+    except Exception:
+        return
+    _orig_generate = VoxelGeneratorV2.generate
+
+    def generate(self, points):
+        try:
+            p = torch.from_numpy(np.ascontiguousarray(points, dtype=np.float32)).npu()
+            out = voxelization(
+                p,
+                voxel_size=[float(v) for v in self.voxel_size],
+                pcr=[float(v) for v in self.point_cloud_range],
+                max_num_points=self.max_num_points,
+                max_voxels=self.max_voxels,
+            )
+            return {
+                'voxels': out.voxels.cpu().numpy(),
+                'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
+                'num_points_per_voxel': out.num_points.cpu().numpy(),
+            }
+        except Exception:
+            return _orig_generate(self, points)
+
+    VoxelGeneratorV2.generate = generate
 
 _F32 = np.float32
 
@@ -661,6 +699,7 @@ def init_patch(jit_compile=False):
     if device != "cuda":
         patch_rotate_iou()
     _alias_spconv()
+    _patch_voxelize_ascendc()
     return device
 
 
