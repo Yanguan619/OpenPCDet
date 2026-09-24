@@ -137,6 +137,16 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_noscatter_noargmax.onnx --fr
   修正旧结论"force_fp16 必丢框"——旧记录针对带 ScatterND/ArgMax 的旧 onnx，当前 noscatter_noargmax base 无此问题）。
 - `npu/convert_fp16_static9000.sh` 已把 force_fp16 升为主交付选项。
 
+### ✅ P2：sigmoid+TopK 图内化（2026-09-23）——后处理 15→3.5ms
+
+- **TopK 不调用 ArgMax**（ONNX/ATC 独立算子）；实测图内 `ReduceMax+TopK(321408→4096)+Gather` 仅 **+0.4ms**
+  （ArgMaxD 才是慢的 ~19ms，已避开——类别标签留 CPU 从 top-4096 算）。
+- `export_onnx.py` 新增 `--topk-only`：输出 `topk_boxes(1,4096,7)/topk_cls(1,4096,3)`（D2H 13MB→~160KB），**无 ArgMax/无 NMS**。
+- `om_ref_demo/test` reshape 改 `(1,-1,7)` 兼容 top-K 输入。
+- **实测（静态 9000 force_fp16，本机 200 帧）**：后处理 15.5→**3.5ms**，E2E 77.8→**64.3ms**；
+  **AP 与 base force_fp16 完全一致（77.81/59.86/38.32）**（raw cls 单调排序 ≡ sigmoid 排序）。
+- 全量 val 用：动态 18000 topk-only om（`weights/pointpillar_nms_base_v2_dynamic_topk.onnx` 转换，命令见对话）。
+
 **合并后 200 帧官方评测（R11 3D moderate）**：**Car 77.90 / Ped 57.95 / Cyc 37.05** —— 与基线**完全一致**（bit 级精度保持）。
 **E2E：82.8ms/帧**（前处理 42 + 推理 24 + 后处理 16.5），基线 369ms → **4.5x**，**达成 <100ms 目标**。
 

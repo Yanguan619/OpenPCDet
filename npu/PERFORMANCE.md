@@ -5,17 +5,19 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 
 ## 1. E2E 延迟现状（200 帧稳态）
 
-| 阶段 | 实现 | fp32 | fp16(mixed) | fp16(force) |
+| 阶段 | 实现 | fp32 | fp16(force) | **fp16+topk图内(P2)** |
 |---|---|---|---|---|
-| 前处理（FOV + voxelize + pad + 读图尺寸） | CPU numpy/numba | 42 ms | 44.5 ms | 41 ms |
-| OM 推理（NPU 前向，静态 M=9000） | NPU | 24 ms | 18 ms | **17 ms** |
-| 后处理（sigmoid + topk + NMS） | CPU torch + numba + numpy | 16.5 ms | 15.5 ms | 15 ms |
-| **E2E 总计** | | **82.8 ms** | **77.8 ms** | **73.1 ms** |
+| 前处理（FOV + voxelize + pad + 读图尺寸） | CPU numpy/numba | 42 ms | 41 ms | 43 ms |
+| OM 推理（NPU 前向，静态 M=9000） | NPU | 24 ms | 17 ms | 17.5 ms |
+| 后处理（sigmoid + topk + NMS） | CPU torch + numba + numpy | 16.5 ms | 15 ms | **3.5 ms** |
+| **E2E 总计** | | **82.8 ms** | **73.1 ms** | **64.3 ms** |
 
-> fp32: `pointpillar_base_fp32_static9000_v2.om`；mixed: `pointpillar_base_fp16_static9000_v2.om`（mixlist 保 VFE）；
-> force: `pointpillar_base_fp16_static9000_force.om`（全图 fp16）。
+> fp32: `pointpillar_base_fp32_static9000_v2.om`；force: `pointpillar_base_fp16_static9000_force.om`；
+> **topk(P2)**: `pp_topk_static9000`（图内 ReduceMax+TopK(4096)，输出 top-K box/cls ~160KB，NMS 留 CPU）。
 > 实测命令：`python npu/om_ref_test.py --om <om> --frames 200`
-> 基线 369ms（2026-09-22 全量）→ force_fp16 73.1ms，累计 **5.0x**。
+> 基线 369ms（2026-09-22 全量）→ topk(P2) 64.3ms，累计 **5.7x**。
+> **P2 精度与 base 完全一致**（top-K 按 raw cls 单调等价 sigmoid 排序）：Car 77.81 / Ped 59.86 / Cyc 38.32。
+> 导出：`python npu/export_onnx.py --topk-only --skip-export --base-output <base> --output <topk>`
 
 ### 1.1 静态 pad-到-18000 fp16 的 E2E 进一步拆分（全量 val 3769 帧）
 
@@ -132,8 +134,9 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 |---|---|---|---|
 | ~~fp16/mixed 静态 9000 OM~~ | `convert_fp16_static9000.sh` + mixlist | 推理 24→**18ms** | ✅ 已测：AP 1% 内（77.76/57.68/37.42） |
 | ~~force_fp16~~ | 全图 fp16 | 推理 →**17ms** | ✅ 已测：AP 1% 内（77.81/59.86/38.32，Ped/Cyc 反升） |
+| **~~P2 topk 图内化~~** | `--topk-only`：图内 ReduceMax+TopK(4096)，NMS 留 CPU | 后处理 15→**3.5ms** | ✅ 已测：E2E 77.8→**64.3ms**，AP 与 base 完全一致 |
 | **Ascend 融合预处理算子（方案 A）** | FOV+mask+voxelize 单 AscendC kernel | 前处理 42→~5-10ms | 最可靠压 E2E；需写 kernel |
-| **M≥18000 静态 OM** | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 命令已备 |
+| **M≥18000 动态/静态 OM** | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force`） |
 | 跨帧流水线 | async D2H 与下帧预处理重叠 | 只提 FPS | 单帧延迟无益 |
 
 ### 性能收益预估
@@ -141,9 +144,9 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 | 组合 | 前处理 | 推理 | 后处理 | E2E |
 |---|---|---|---|---|
 | 现状 fp32（实测） | 42 ms | 24 ms | 16.5 ms | **82.8 ms** |
-| fp16 mixed（实测） | 44.5 ms | 18 ms | 15.5 ms | **77.8 ms** |
 | force_fp16（实测） | 41 ms | 17 ms | 15 ms | **73.1 ms** |
-| +Ascend 融合预处理 | 5-10 | 17 | 15 | **~40 ms** |
+| **force_fp16 + topk图内（实测）** | 43 ms | 17.5 ms | 3.5 ms | **64.3 ms** |
+| +Ascend 融合预处理 | 5-10 | 17.5 | 3.5 | **~28 ms** |
 
 ## 8. 测速方法
 
