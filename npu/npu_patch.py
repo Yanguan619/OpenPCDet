@@ -31,23 +31,32 @@ def _alias_spconv():
 
     使 `from spconv.utils import VoxelGeneratorV2` 无需仓库根目录的 spconv 符号链接，
     任何机器（含无 unum_ops 相邻部署）都能通过本补丁解析。必须在 import pcdet 之前调用。
+
+    注意：必须用强制赋值而非 setdefault——unum_ops 自身在导入时会经 sparse_modules 触发
+    顶层 `import spconv`，产生与 unum_ops.spconv 同路径的**第二份拷贝**；setdefault 会因
+    该拷贝已存在而静默失效，导致下游拿到的类与这里 patch 的不是同一个。
     """
     try:
         import unum_ops.spconv
         import unum_ops.spconv.utils
     except ImportError:
         return
-    sys.modules.setdefault('spconv', sys.modules['unum_ops.spconv'])
-    sys.modules.setdefault('spconv.utils', sys.modules['unum_ops.spconv.utils'])
+    sys.modules['spconv'] = sys.modules['unum_ops.spconv']
+    sys.modules['spconv.utils'] = sys.modules['unum_ops.spconv.utils']
 
 
 def _patch_voxelize_ascendc():
     """将 VoxelGeneratorV2.generate 路由到 unum_ops 的 AscendC 硬体素化（NPU kernel）。
 
-    输出与 CPU numba 版逐位一致（voxels/npp/coords 已验证 2306/2306），仅 coords 序
-    为 (x,y,z) → 转回 spconv 的 (z,y,x)。全量点（demo 无 FOV）~2x 快，FOV 后小输入
-    持平。任何异常自动回退 CPU 原路径。可用环境变量 NPU_ASCENDC_VOXELIZE=0 关闭。
+    输出与 CPU numba 版**排序等价**（coord 多重集相同、同 coord 特征/npp 相同）但行序不同，
+    coords 序为 (x,y,z) → 转回 spconv 的 (z,y,x)；端到端 200 帧 OM AP 与 numba 基线
+    逐位一致（红线通过）。全量点（demo 无 FOV）~2.5x 快，FOV 后小输入持平。任何异常
+    自动回退 CPU 原路径（首次回退打印警告，不静默）。可用环境变量 NPU_ASCENDC_VOXELIZE=0
+    关闭。幂等，可重复调用。
     """
+    global _VOXELIZE_PATCHED, _VOX_ORIG_GENERATE
+    if _VOXELIZE_PATCHED:
+        return
     if os.environ.get('NPU_ASCENDC_VOXELIZE', '1') != '1':
         return
     try:
@@ -56,6 +65,7 @@ def _patch_voxelize_ascendc():
     except Exception:
         return
     _orig_generate = VoxelGeneratorV2.generate
+    _VOX_ORIG_GENERATE = _orig_generate
 
     def generate(self, points):
         try:
@@ -72,10 +82,20 @@ def _patch_voxelize_ascendc():
                 'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
                 'num_points_per_voxel': out.num_points.cpu().numpy(),
             }
-        except Exception:
+        except Exception as e:
+            global _VOX_FALLBACK_WARNED
+            if not _VOX_FALLBACK_WARNED:
+                print(f'[npu_patch] AscendC voxelize 回退 CPU numba（首次）: '
+                      f'{type(e).__name__}: {e}', flush=True)
+                _VOX_FALLBACK_WARNED = True
             return _orig_generate(self, points)
 
     VoxelGeneratorV2.generate = generate
+    _VOXELIZE_PATCHED = True
+
+_VOXELIZE_PATCHED = False
+_VOX_FALLBACK_WARNED = False
+_VOX_ORIG_GENERATE = None
 
 _F32 = np.float32
 
@@ -367,12 +387,9 @@ def patch_cuda_ops():
     _patch_bev_pool()
     _patch_roipoint_pool3d()
     _patch_hungarian_assigner()
-    try:
-        from npu.npu_patch_pointnet2 import patch_pointnet2_ops
-        patch_pointnet2_ops()
-    except Exception:
-        import traceback
-        traceback.print_exc()
+
+    from npu.ops_native.pointnet2 import patch_pointnet2_ops
+    patch_pointnet2_ops()
 
 
 def _patch_iou3d_nms_utils():
@@ -751,6 +768,12 @@ def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None):
 # 确保任意 `from pcdet...` 之前 stub 已就位（幂等）。
 patch_cuda_ops()
 
+# 生产链路（om_ref_demo/om_ref_test/om_ref_test_pt 等）只 import 本模块、不调 init_patch()，
+# 故在此 import 时即：① alias spconv→unum_ops shim（否则顶层 spconv 与 unum_ops.spconv 是两份拷贝，
+# patch 打不到消费者用的类）；② 启用 AscendC 体素化；NPU_ASCENDC_VOXELIZE=0 可关闭（自动回退 CPU numba）。
+_alias_spconv()
+_patch_voxelize_ascendc()
+
 
 class PPWrapper(torch.nn.Module):
     """PointPillar module_list 前向封装：喂入 voxel 输入，输出 (box_preds, cls_preds)。
@@ -774,3 +797,23 @@ class PPWrapper(torch.nn.Module):
         for m in self.module_list:
             batch_dict = m(batch_dict)
         return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
+
+
+def hard_exit(code=0):
+    """硬退出，跳过 aclruntime↔torch_npu 双运行时的 teardown 冲突。
+
+    AscendC 体素化会在 aclruntime 进程内拉起 torch_npu 设备上下文（.npu() +
+    aclnn 走 torch_npu stream），进程自然退出时两运行时争抢 reset device 会
+    segfault/bus error。结果已全部输出完后再硬退即可（先 flush 全部缓冲）。
+    """
+    import logging
+
+    for handler in logging.root.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

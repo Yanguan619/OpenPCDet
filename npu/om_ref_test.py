@@ -389,6 +389,8 @@ def main():
         # 官方 KITTI 评测（与 tools/test.py 的 eval_one_epoch 同口径，R11/R40 AP）
         run_official_eval(preds_by_frame, demo_dataset, sample_ids, CLASS_NAMES)
 
+    npu.npu_patch.hard_exit(0)
+
 
 if __name__ == "__main__":
     main()

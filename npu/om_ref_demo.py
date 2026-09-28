@@ -592,6 +592,7 @@ def main():
             print('\n(未找到 label 文件，跳过对比。可用 --label 指定)')
 
     logger.info('Demo done.')
+    npu.npu_patch.hard_exit(0)
 
 
 if __name__ == '__main__':
