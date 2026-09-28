@@ -30,7 +30,7 @@ PY
 
 echo
 echo "=== 2. 必需交付物存在性 / 语法检查 ==="
-for f in npu/infer.py npu/eval.py npu/npu_patch.py; do
+for f in npu/debug/infer.py npu/debug/eval.py npu/npu_patch.py; do
     if [ ! -f "$f" ]; then
         echo "FAIL: $f 缺失"; exit 1
     fi
@@ -50,14 +50,14 @@ PY
 echo
 echo "=== 4. 推理验证: infer.py (frames=%d) ===" % "$FRAMES"
 rm -rf "$PREDS_DIR"
-python npu/infer.py --device auto --frames "$FRAMES" --save-preds "$PREDS_DIR"
+python npu/debug/infer.py --device auto --frames "$FRAMES" --save-preds "$PREDS_DIR"
 N_FILES=$(ls "$PREDS_DIR" | wc -l)
 echo "OK  推理产出 $N_FILES 个预测文件"
 [ "$N_FILES" -gt 0 ] || { echo "FAIL: 无预测文件"; exit 1; }
 
 echo
 echo "=== 5. 任务评测: eval.py ==="
-python npu/eval.py --preds "$PREDS_DIR" --frames "$FRAMES" | tail -40
+python npu/debug/eval.py --preds "$PREDS_DIR" --frames "$FRAMES" | tail -40
 
 echo
 echo "=== 完成 ==="

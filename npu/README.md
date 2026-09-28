@@ -1,7 +1,7 @@
 # PointPillars (OpenPCDet) — NPU 移植版
 
 基于 [OpenPCDet](https://github.com/open-mmlab/OpenPCDet) 的 PointPillars 模型在**昇腾 NPU（Ascend 310P3）**上的推理移植。
-支持 GPU / NPU 双环境运行，提供从 PyTorch checkpoint → ONNX → OM 的完整链路与官方 KITTI 评测。
+支持 GPU / NPU 双环境运行，提供从 PyTorch checkpoint → ONNX → OM → 官方 KITTI 评测的完整链路。
 
 ## 环境
 
@@ -16,77 +16,78 @@ NPU 环境通过 `unum_ops.spconv`（numpy 体素化 shim）替代原生 spconv�
 
 ```
 npu/
-├── infer.py            # 推理入口（build_data/pre_process/build_model/post_process/main）
-├── eval.py             # 官方 KITTI 评测入口
-├── npu_patch.py        # 设备检测/算子适配统一补丁（init_patch）
-├── verify_npu.sh       # 环境→补丁→推理→评测 串联验证
-├── quick_eval.py       # 快速评估（GPU/NPU 通用，生成 preds + 自动官方评测）
-├── compute_kitti_ap.py # 快速 BEV AP（sanity check）
-├── om_ref_test.py      # 全量 val 评测（OM 后端，内嵌官方 AP；--quick 简化口径）
-├── om_ref_test_pt.py   # 全量 val 推理（PyTorch 后端）
-├── export_onnx.py      # ONNX 导出 + 图手术（含 NMS）
-├── export_full.py      # PyTorch 直接导出（含后处理，替代图手术方案）
-├── export_postproc.py  # 导出 PPWrapper+后处理（无 NMS）
-├── atc.py              # ATC 转 OM（动态/静态/fp32/fp16/mixed）
-├── om_ref_demo.py          # 单帧 .bin 推理（OM，分段计时）
-├── demo.py             # 单帧 demo（可视化）
-├── perf_e2e.py         # E2E 性能测试
-├── compare_pt_om.py    # PyTorch vs OM 数值对比
-├── README.md           # 本文档
-├── PRECISION.md        # 精度评测文档
-├── PERFORMANCE.md      # 性能分析文档
-└── CHANGELOG.md        # 变更记录
+├── om_ref_demo.py        # 单帧 .bin 推理（OM 后端，分段计时 + label 对比）
+├── om_ref_test.py        # 全量 val 评测（OM 后端，内嵌官方 AP；--quick 简化口径）
+├── om_ref_test_pt.py     # 全量 val 推理（PyTorch 后端）
+├── export_onnx.py        # ONNX 导出 + 图手术（--fold-bn/--dynamic/--topk-only）
+├── npu_patch.py          # 设备检测/算子适配统一补丁（init_patch）
+├── verify_npu.sh         # 环境→补丁→推理→评测 串联验证
+├── convert_fp16_static9000.sh  # fp16 OM 转换脚本（静态 9000 + 动态/静态 18000）
+├── ops_native/           # 纯 numpy/numba 算子（voxelize、FOV、iou3d NMS）
+├── debug/                # 历史/辅助脚本（见下）
+├── README.md / PRECISION.md / PERFORMANCE.md / CHANGELOG.md
+└── debug/
+    ├── infer.py          # PyTorch 推理入口（旧，build_data/build_model/post_process）
+    ├── eval.py           # 官方 KITTI 评测入口（旧）
+    ├── quick_eval.py     # 快速评估（PyTorch，推理 + 自动官方评测）
+    ├── atc.py            # ATC 转 OM 封装（动态/静态/fp32/fp16/mixed）
+    ├── compare_pt_om.py  # PyTorch vs OM 数值对比
+    ├── perf_e2e.py       # E2E 分段计时
+    ├── demo.py / export_full.py / export_postproc.py / compute_kitti_ap.py / torch_infer.py / eval_om_nms.py
+    └── profiler*/parse_msprof.sh   # msprof 性能剖析
 ```
 
-## 快速开始（PyTorch 推理 + 官方评测）
+## 快速开始
+
+### OM 推理 + 官方评测（主路径）
 
 ```bash
-# 1. 推理（device 可选 auto/npu/cuda:0/cpu）
-python npu/infer.py --ckpt weights/pointpillar_7728.pth --device auto \
-    --frames 200 --save-preds preds
+# 单帧 demo（含前/后处理 + label 对比；demo 无 FOV 过滤，体素化 122555 点）
+python npu/om_ref_demo.py \
+    --cfg_file tools/cfgs/kitti_models/pointpillar.yaml \
+    --data_path data/kitti/training/velodyne/000008.bin \
+    --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om
 
-# 2. 官方 KITTI 评测（bbox/bev/3d AP，R11+R40）
-python npu/eval.py --preds preds --frames 200
+# 全量 val 评测（200 帧：输出 前处理/推理/后处理 拆分 + 官方 R11/R40 AP）
+python npu/om_ref_test.py \
+    --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om --frames 200
 
-# 3. 一键验证（环境 + 补丁 + 推理 + 评测）
-bash npu/verify_npu.sh --frames 5
+# 只看简化计时（跳过官方评测）
+python npu/om_ref_test.py --om <om> --frames 50 --quick
 ```
 
-### 快速评估（推荐调试用）
+### PyTorch 后端推理 + 官方评测
 
 ```bash
-python npu/quick_eval.py --device cuda:0 --frames 200 --save-preds /tmp/preds
+python npu/om_ref_test_pt.py --ckpt weights/pointpillar_7728.pth --device npu \
+    --frames 200 --save-preds preds_pt
 ```
 
-`quick_eval.py` 推理后自动运行官方评测，输出 Car/Pedestrian/Cyclist 的 bbox/bev/3d AP。
-
-### 快速 BEV AP（不依赖官方 eval）
-
-```bash
-python npu/compute_kitti_ap.py --preds /tmp/preds
-```
+（旧入口 `npu/debug/infer.py` + `npu/debug/eval.py` 仍可用；`npu/debug/quick_eval.py` 一键推理+评测。）
 
 ## ONNX 导出 → ATC 转 OM → NPU 推理
 
 ```bash
-# 1. 导出 ONNX（纯 CPU，无需 NPU）
+# 1. 导出 ONNX（纯 CPU，无需 NPU）：base（batch_box_preds/batch_cls_preds）+ 可选图手术
 python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
-    --output weights/pointpillar_demo.onnx
+    --output weights/pp_base.onnx --base-output weights/pp_base.onnx --fold-bn
 
-# 2. ATC 转 OM（force_fp32 保证精度）
-python npu/atc.py --fp32 --skip-export
-#   或等价命令：--precision_mode=force_fp32 --soc_version=Ascend310P3
+# 2. ATC 转 OM（推荐 fp16 force；见 npu/PERFORMANCE.md §4 的完整命令）
+#    动态 18000 force_fp16（全量 val）：
+atc --model=weights/pp_base.onnx --framework=5 --soc_version=Ascend310P3 \
+    --output=weights/pointpillar_base_fp16_dynamic18000_force \
+    --input_format=ND --precision_mode=force_fp16 \
+    --input_shape="voxels:1~18000,32,4;voxel_num_points:1~18000;voxel_coords:1~18000,4;bev_index_map:214272"
 
-# 3. OM 单帧推理
-python npu/om_ref_demo.py --bin data/kitti/training/velodyne/000008.bin \
-    --om weights/pointpillar_fp32_linux_aarch64.om --num-iters 20
-
-# 4. 全量 val 评测（OM 后端，内嵌官方 AP 评测，R11/R40 bbox/bev/3d）
-python npu/om_ref_test.py --om weights/pointpillar_mixed_float16_dyn9000_linux_aarch64.om
-python npu/om_ref_test.py --om <om> --quick     # 只看简化 Recall/Precision
+# 3. OM 单帧推理 / 全量评测
+python npu/om_ref_demo.py --data_path <bin 或目录> --om weights/<你的 om>.om
+python npu/om_ref_test.py --om weights/<你的 om>.om
 ```
 
-### 输入输出规格（ONNX/OM）
+> 也可用 `npu/debug/atc.py` 封装（`--fp32/--fp16/--mixed --dynamic/--static`）。
+> 现成 OM：`weights/pointpillar_base_fp16_dynamic18000_{force,topk}_linux_aarch64.om`、`..._static18000_force.om`。
+
+### 输入输出规格（base OM）
 
 | 名称 | shape | dtype | 说明 |
 |---|---|---|---|
@@ -97,15 +98,18 @@ python npu/om_ref_test.py --om <om> --quick     # 只看简化 Recall/Precision
 | `batch_box_preds` | (1, 321408, 7) | float32 | 解码后 lidar 框 [x,y,z,dx,dy,dz,heading] |
 | `batch_cls_preds` | (1, 321408, 3) | float32 | 分类 logits（未 sigmoid） |
 
-> 321408 = 216×248（BEV 网格）× 2（rot）× 3（class）。
-> 后处理（sigmoid + topk + NMS）在 Python 侧完成，不包含在 ONNX/OM 中。
+- 321408 = 216×248（BEV 网格）× 2（rot）× 3（class）。
+- **base OM**：后处理（sigmoid + topk + NMS）在 Python 侧完成。
+- **topk OM**（`--topk-only` 导出）：图内 ReduceMax+TopK(4096)+Gather，输出
+  `topk_boxes (1,4096,7)` / `topk_cls (1,4096,3)`，D2H 13MB→164KB，NMS 仍留 CPU；脚本自动适配。
 
 ### ATC 精度要点
 
-- **必须 `--precision_mode=force_fp32`**：默认 force_fp16 逐元素偏差越过 NMS 阈值会丢框（24→23）。
-- 静态导出 M 固定（000008 → 3941），换帧需重导；全量评测用动态 OM（`voxels:1~9000`）。
+- 当前 base（noscatter+noargmax）下 **`force_fp16` 已验证 AP 1% 容差内**（Car 77.81 / Ped 59.86 / Cyc 38.32，
+  200 帧 R11 3D moderate），无需强制 fp32。（旧的"force_fp16 必丢框"结论针对早期含 ScatterND/ArgMax 的导出。）
+- 动态 shape 用 **range 记法** `voxels:1~18000`，**勿用 `-1`/`--dynamic_dims`**（避免 ATC mbatch 切分报错）。
+- dtype：`voxel_num_points`/`voxel_coords` 为 int32、`bev_index_map` 为 int64，ATC 不可覆盖。
 - `voxel_coords` 经 collate 后是 Fortran 序，喂 OM 前必须 `np.ascontiguousarray`。
-- aclruntime 输出取数：`t.to_host()`（原地）后 `np.frombuffer(memoryview(t), dtype).reshape(t.shape).copy()`。
 
 ## 模型与权重
 
@@ -115,9 +119,10 @@ python npu/om_ref_test.py --om <om> --quick     # 只看简化 Recall/Precision
 
 ## 性能结论（摘要）
 
-- PyTorch NPU 推理：~273 ms/帧（200 帧，含前/后处理）。
-- OM（mixed_float16 + 优化）：NPU 前向 **15.7 ms**（单帧 demo）。
-- 瓶颈在 host 侧 FOV 过滤 + voxelize + 后处理（CPU），NPU 推理仅占 ~10%。
+- **数据集全量口径**（有 FOV，动态 18000 topk fp16）：E2E **63.3 ms/帧**（前处理 37.5 + 推理 22 + 后处理 4）。
+- **单帧 demo 完整推理**（无 FOV，含体素化 122555 点）：**93 ms**（getitem 体素化占 ~58%）。
+- 基线 369ms（2026-09-22 全量）→ 当前 63.3ms，累计 **5.8x**。
+- 瓶颈在 host 侧前处理（FOV + voxelize），NPU 推理仅占 ~35%。
 - 详细见 `npu/PERFORMANCE.md`。
 
 ## 文档索引
