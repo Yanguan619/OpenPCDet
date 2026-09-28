@@ -22,10 +22,16 @@ version.py
 # 运行产物与本地缓存
 preds_*/
 .opencode/
+.cortexkit/
 .python-version
 fusion_result.json
 ge_check_op.json
 spconv
+# 模型/权重产物（大文件不入 git）
+weights/
+*.onnx.data
+test.log
+test2.log
 # 豁免（保留脚本）
 !npu/verify_npu.sh
 !npu/convert_fp16_static9000.sh

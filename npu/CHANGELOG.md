@@ -8,6 +8,31 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ AscendC voxelize 启用（2026-09-28）
+
+- **改动**：`npu_patch._patch_voxelize_ascendc`（unum_ops，commit 6b90b4e）从「仅 `init_patch()` 触发」改为
+  **`import npu_patch` 时直接启用**——原路由一直休眠，生产链路实际跑 CPU numba（om_ref_demo/test/test_pt
+  只 import npu_patch 从不调 init_patch）。`NPU_ASCENDC_VOXELIZE=0` 可关闭回退 numba。
+- **别名修复**：`_alias_spconv` 由 `setdefault` 改**强制赋值**——unum_ops 导入时会经 sparse_modules.py:229
+  `import spconv.pytorch` 触发顶层 `import spconv`，产生与 `unum_ops.spconv` 同路径的**第二份拷贝**，
+  setdefault 因拷贝已存在而静默失效，patch 落在 unum_ops 副本、下游拿到的是未 patch 的顶层副本（类不同名）。
+- **性能**（demo 000008，M=7260，全量 122555 点）：generate **AscendC ~25ms vs numba ~45-53ms（2.5x）**。
+  早前「无提速/更慢」结论为跨进程噪声 + wrapper `except Exception` **静默回退 numba** 假象（op 抛异常被吞掉），
+  已加回退日志不再静默。
+- **精度**：voxel 逐帧**排序等价**（sorted-equal，coord 多重集相同、同 coord 特征/npp 相同）但行序与 numba 不同；
+  200 帧中 199 帧 sorted-equal，frame 38 少 1 个越界边界体素（coord z=432 超出 BEV 网格，不影响输出）；
+  **200 帧 OM AP 与 numba 基线逐位一致（diff=0）**。（早期「voxel diff=0 逐位一致」表述过于乐观，以本节口径为准。）
+- **副作用修复**：AscendC 把 torch_npu 设备上下文拉进 aclruntime 进程，自然退出时双运行时 teardown 冲突
+  segfault/bus error（结果已全部产出）；`om_ref_demo/om_ref_test` 结果输出后调 **`npu_patch.hard_exit(0)`** 硬退出。
+- **kernel 级优化已实验为死路（2026-09-28）**：worktree（`omos/voxel-multicube`，/data/workspace/unum_ops）把
+  `MAX_NBLK=7`→15 重建 + 安装 OPP 实测**无提速**（21.8 vs 21.3ms）——kernel 受 12 次软件栅障 + 全量 L1 dcci 串行化
+  限制，**不是核数限制**（310P7 整颗 AIV 数小，nblk 被封顶）；且 nblk>7 会改变 voxel 行序。已回滚 vendor 并重验
+  200 帧 AP 逐位一致。
+- **OPP 安装/回滚教训**：CANN runtime 加载 `opp/vendors/` 下**全部** vendor 的 op_api/opmaster（字母序后者覆盖），
+  `config.ini load_priority` 不控制 aclnn 符号解析；`.run` 安装会升级目标 vendor；回滚以 docker overlay2 diff 层为准，
+  完成后须 `diff -rq` 核对 + 重验 200 帧 AP。
+- PERFORMANCE.md 更新：5.1、1.3（getitem/E2E 重算为 est.）、7 方案 A、收益预估表。
+
 ### ✅ P2 topk 图内化已全量口径验证（2026-09-28）
 
 - **topk OM**：`pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om`（图内 ReduceMax+TopK(4096)+
