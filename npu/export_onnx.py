@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import onnx
+import torch
+import torch.nn as nn
 from onnx import helper, TensorProto, mapping
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +25,24 @@ sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 NUM_ANCHORS = 321408
+
+
+class PPWrapper(nn.Module):
+    """PointPillars 前向包装：4 输入 → batch_box_preds, batch_cls_preds（无后处理）。
+
+    模块级定义供 om_ref_test_pt 等脚本复用；export_base_onnx 内部实例化。
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.module_list = model.module_list
+
+    def forward(self, voxels, voxel_num_points, voxel_coords, bev_index_map):
+        batch_dict = {"voxels": voxels, "voxel_num_points": voxel_num_points,
+                      "voxel_coords": voxel_coords, "bev_index_map": bev_index_map, "batch_size": 1}
+        for m in self.module_list:
+            batch_dict = m(batch_dict)
+        return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
 
 
 # ============================================================
@@ -92,17 +112,6 @@ def export_base_onnx(output_path, args):
     index_map = np.full(432 * 496, M, dtype=np.int64)
     index_map[indices.astype(np.int64)] = np.arange(M, dtype=np.int64)
     bev_index_map = torch.from_numpy(index_map).npu()
-
-    class PPWrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.module_list = model.module_list
-        def forward(self, voxels, voxel_num_points, voxel_coords, bev_index_map):
-            batch_dict = {"voxels": voxels, "voxel_num_points": voxel_num_points,
-                          "voxel_coords": voxel_coords, "bev_index_map": bev_index_map, "batch_size": 1}
-            for m in self.module_list:
-                batch_dict = m(batch_dict)
-            return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
 
     wrapper = PPWrapper(model)
     dynamic_axes = None
