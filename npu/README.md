@@ -12,6 +12,70 @@
 
 NPU 环境通过 `unum_ops.spconv`（numpy 体素化 shim）替代原生 spconv，`pcdet` 代码无硬编码 `.npu()`，依赖 torch_npu 设备层，因此同一套代码可在 GPU 上直接运行做基线。
 
+## 依赖安装与数据准备（新设备）
+
+> `weights/`（模型/OM 产物）与 `data/`（KITTI 数据集）**不入 git**，新设备需按下述步骤自行准备。以下步骤的前提是环境版本（见上表）就绪：CANN 9.0.0 + torch 2.7.1 + torch_npu 2.7.1 + aclruntime（安装步骤见昇腾文档）+ python 3.11。
+
+### 1. NPU 依赖：unum_ops（含 AscendC 体素化 kernel）
+
+`npu_patch` 依赖 `unum_ops` 提供 spconv 的 numpy shim 与 AscendC 体素化 kernel：
+
+```bash
+git clone https://github.com/Yanguan619/unum_ops.git
+cd unum_ops && pip install -e .
+```
+
+- `pip install` 时 hatch_build 钩子会**自动构建并安装 AscendC OPP 包**（`csrc/ascend/voxelization_v2` → CANN `opp/vendors/`），需 CANN 环境可用（`ASCEND_HOME_PATH`）。
+- 无 CANN / OPP 构建失败时不影响 Python 侧 spconv/numpy shim（体素化自动回退 CPU numba，功能可用）。
+- 不装 unum_ops 则 `from spconv.utils import VoxelGeneratorV2` 会 ImportError（除非另装原生 spconv）——unum_ops 是必需依赖。
+
+### 2. 权重与 OM（自行生成）
+
+`weights/` 不入 git（本机 934MB 模型产物）。新设备流程：**下载权重 → 导出 ONNX → ATC 转 OM**。
+
+```bash
+mkdir -p weights
+
+# (a) 官方 PointPillar 权重（OpenPCDet v0.6.0 Model Zoo，本仓库命名为 pointpillar_7728.pth）：
+#     https://drive.google.com/file/d/1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm/view?usp=sharing
+#     下载后存为 weights/pointpillar_7728.pth
+
+# (b) base ONNX（batch_box_preds/batch_cls_preds，noscatter+noargmax）
+python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
+    --output weights/pp_base.onnx --base-output weights/pp_base.onnx --fold-bn
+
+# (c) ATC 转 base OM（动态 18000，force_fp16；需装有 CANN 的机器执行）
+atc --model=weights/pp_base.onnx --framework=5 --soc_version=Ascend310P3 \
+    --output=weights/pointpillar_base_fp16_dynamic18000_force \
+    --input_format=ND --precision_mode=force_fp16 \
+    --input_shape="voxels:1~18000,32,4;voxel_num_points:1~18000;voxel_coords:1~18000,4;bev_index_map:214272"
+
+# (d) 可选：topk OM（图内 TopK 4096，推荐，后处理 11.8→4ms；AP 与 base 逐位一致）
+python npu/export_onnx.py --topk-only --skip-export --base-output weights/pp_base.onnx \
+    --output weights/pp_topk.onnx --fold-bn
+atc --model=weights/pp_topk.onnx --framework=5 --soc_version=Ascend310P3 \
+    --output=weights/pointpillar_base_fp16_dynamic18000_topk \
+    --input_format=ND --precision_mode=force_fp16 \
+    --input_shape="voxels:1~18000,32,4;voxel_num_points:1~18000;voxel_coords:1~18000,4;bev_index_map:214272"
+```
+
+> ATC 产物命名规则：`<名称>_linux_aarch64.om`（推理脚本按此后缀查找）。更多转换组合（fp32/静态 18000 等）见 `npu/PERFORMANCE.md`。
+
+### 3. KITTI 数据（data/ 不入 git）
+
+从 [KITTI 3D Object Detection](http://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d)（需注册）下载并组织：
+
+```bash
+mkdir -p data/kitti/training/{calib,image_2,label_2,velodyne,planes}
+mkdir -p data/kitti/testing/{calib,image_2,velodyne}
+# 解压 data_object_calib/label_2/image_2/velodyne.zip（训练集 ~12GB）到对应目录；
+# ImageSets/{test,train,trainval,val}.txt 取自 OpenPCDet 上游仓库 data/kitti/ImageSets/
+
+# 生成 infos（om_ref_test 依赖 kitti_infos_val.pkl）
+python -m pcdet.datasets.kitti.kitti_dataset create_kitti_infos \
+    tools/cfgs/dataset_configs/kitti_dataset.yaml
+```
+
 ## 目录结构
 
 ```
@@ -85,7 +149,8 @@ python npu/om_ref_test.py --om weights/<你的 om>.om
 ```
 
 > 也可用 `npu/debug/atc.py` 封装（`--fp32/--fp16/--mixed --dynamic/--static`）。
-> 现成 OM：`weights/pointpillar_base_fp16_dynamic18000_{force,topk}_linux_aarch64.om`、`..._static18000_force.om`。
+> 现成 OM（本机，不入 git）：`weights/pointpillar_base_fp16_dynamic18000_{force,topk}_linux_aarch64.om`、
+> `..._static18000_force.om`；新设备按上文「依赖安装与数据准备」自行生成。
 
 ### 输入输出规格（base OM）
 
@@ -120,7 +185,7 @@ python npu/om_ref_test.py --om weights/<你的 om>.om
 ## 性能结论（摘要）
 
 - **数据集全量口径**（有 FOV，动态 18000 topk fp16）：E2E **63.3 ms/帧**（前处理 37.5 + 推理 22 + 后处理 4）。
-- **单帧 demo 完整推理**（无 FOV，含体素化 122555 点）：**93 ms**（getitem 体素化占 ~58%）。
+- **单帧 demo 完整推理**（无 FOV，含体素化 122555 点）：**~67 ms**（est.，体素化切 AscendC 后；原 numba ~93ms，静机待重测）。
 - 基线 369ms（2026-09-22 全量）→ 当前 63.3ms，累计 **5.8x**。
 - 瓶颈在 host 侧前处理（FOV + voxelize），NPU 推理仅占 ~35%。
 - 详细见 `npu/PERFORMANCE.md`。
