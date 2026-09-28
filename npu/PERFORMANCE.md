@@ -1,7 +1,7 @@
 # PointPillars 性能分析（PERFORMANCE）
 
 PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化方向。
-**当前最新：E2E 73.1ms/帧（force_fp16，<100ms 达标），200 帧 AP 全部在基线 1% 容差内（Car 甚至持平）。**
+**当前最新：单帧 demo 完整推理 93ms（fp16 force + topk 图内，无 FOV）；数据集全量 E2E 63.3ms/帧；AP 与 base 逐位一致（Car 77.81 / Ped 59.86 / Cyc 38.32）。**
 
 ## 1. E2E 延迟现状（200 帧稳态）
 
@@ -52,6 +52,43 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 且静态 pad 与动态预测**逐位一致**（pad 行不参与 scatter），全量 AP 完全相同。
 **全量 val 推荐动态 fp16 om**（`pointpillar_base_fp16_dynamic18000_force_linux_aarch64.om`）。
 
+### 1.3 单帧 demo 完整推理延迟（om_ref_demo，无 FOV 过滤）
+
+> 与 1.1/1.2 不同：demo 路径**不做 FOV 过滤**（与 `tools/demo.py` 一致），直接体素化 122555 原始点。
+> 以下为单帧完整 E2E（含 `__getitem__` 体素化），本机 000008，avg 10。
+
+| 阶段 | base fp16 static18000 | **topk fp16 dynamic18000** |
+|---|---|---|
+| getitem（读 bin + 体素化 122555 点） | 55.5 ms（51%） | 53.9 ms（58%） |
+| collate + to_tensor | 5.2 ms | 5.3 ms |
+| pad / index_map | 6.1 ms | 0.7 ms |
+| feeds（aclruntime.Tensor） | 6.9 ms | 2.1 ms |
+| **forward** | 19.9 ms | 25.0 ms |
+| postproc（sigmoid + topk + NMS） | 15.3 ms | 6.0 ms |
+| **单帧完整 E2E** | **109.0 ms** | **93.0 ms** |
+
+> **三种口径的区别**（务必区分）：
+> - **单帧完整**（demo，无 FOV）：93ms（topk）——含体素化，`getitem` 占 51-58%；
+> - **推理链路**（不含体素化）：~39ms（collate + pad + feeds + forward + postproc）；
+> - **数据集全量**（test，有 FOV 过滤到 17221 点）：63.3ms/帧——FOV 让体素化输入减 7 倍，
+>   虽然多一步 FOV，但体素化省更多 → 反而比 demo 快。
+> - topk 单帧完整比 base 省 **16ms**（postproc -9.3 + feeds/pad -7，forward +5）。
+> - **`OM inference time` 只计 forward 段**，不代表整帧。
+
+### 1.4 topk 图内 OM（P2）全量口径验证（动态 18000，200 帧）
+
+| 指标 | base fp16 dynamic18000 | **topk fp16 dynamic18000** |
+|---|---|---|
+| 前处理（FOV + voxelize） | ~34.5 ms | 37.5 ms |
+| 推理 | ~21.3 ms | 22.0 ms |
+| **后处理** | ~11.8 ms | **4.0 ms** |
+| **E2E avg** | ~67.5 ms | **63.3 ms** |
+| AP（Car/Ped/Cyc） | 77.07/51.93/61.95 | 77.07/51.93/61.95（**逐位一致**） |
+
+> topk OM 输出 `topk_boxes (1,4096,7)` / `topk_cls (1,4096,3)`（图内 ReduceMax+TopK(4096)，
+> 无 ArgMax/NMS），D2H 13MB→164KB；`om_ref_demo/test` 的 `base_mode` 自动适配（无需改码）。
+> 转换命令见下方；`skipped_M=0` 全跑通。
+
 ## 1b. 精度（200 帧 3D moderate R11，1% 容差）
 
 | 类 | fp32 基线 | fp16(mixed) | fp16(force) |
@@ -83,6 +120,8 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 | `pointpillar_base_fp16_static9000_v2.om` | 静态 M=9000 | - | **18 ms** | mixed_float16 + mixlist，AP 1% 内 |
 | `pointpillar_base_fp16_static9000_force.om` | 静态 M=9000 | - | **17 ms** | **force_fp16 全图**，AP 1% 内（最优） |
 | `pointpillar_base_fp32_dynamic_linux_aarch64_linux_aarch64.om` | 动态 M=1~9000 | ~173 ms | - | 全量 val 动态（旧，ScatterND 未除） |
+| `pointpillar_base_fp16_dynamic18000_force_linux_aarch64.om` | 动态 M=1~18000 | - | 21.3 ms | 全量 val 推荐（动态，无 pad 浪费） |
+| `pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 4096） | - | 22.0 ms | **P2 topk 图内**，后处理 11.8→4ms，AP 与 base 逐位一致 |
 
 ### 前向优化链（186ms → 24ms，7.8x）
 
@@ -100,6 +139,16 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 - **静态 9000 OM 只覆盖 M≤9000 的帧**：抽样 100 帧 val，54% 帧 M>9000（最大 ~16664）→ 全量 val 需
   **M≥18000 静态 OM** 或 **动态 OM（range 加大）**。转换命令已备于 `npu/convert_fp16_static9000.sh`。
 - 全量 val 200 帧基准 AP（静态 9000）：Car 77.90 / Ped 57.95 / Cyc 37.05（与官方基线 1% 内）。
+
+**topk OM（P2）转换命令**（onnx：`weights/pointpillar_nms_base_v2_dynamic_topk.onnx`）：
+```bash
+# 动态 18000 force_fp16（全量 val 推荐）
+atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
+    --soc_version=Ascend310P3 --output=weights/pointpillar_base_fp16_dynamic18000_topk \
+    --input_format=ND --precision_mode=force_fp16 \
+    --input_shape="voxels:1~18000,32,4;voxel_num_points:1~18000;voxel_coords:1~18000,4;bev_index_map:214272"
+# 静态 18000 版同理（M 固定 18000，勿加 --dynamic_dims）
+```
 
 ## 5. 瓶颈剖析（当前）
 
@@ -134,9 +183,9 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 |---|---|---|---|
 | ~~fp16/mixed 静态 9000 OM~~ | `convert_fp16_static9000.sh` + mixlist | 推理 24→**18ms** | ✅ 已测：AP 1% 内（77.76/57.68/37.42） |
 | ~~force_fp16~~ | 全图 fp16 | 推理 →**17ms** | ✅ 已测：AP 1% 内（77.81/59.86/38.32，Ped/Cyc 反升） |
-| **~~P2 topk 图内化~~** | `--topk-only`：图内 ReduceMax+TopK(4096)，NMS 留 CPU | 后处理 15→**3.5ms** | ✅ 已测：E2E 77.8→**64.3ms**，AP 与 base 完全一致 |
+| **~~P2 topk 图内化~~** | `--topk-only`：图内 ReduceMax+TopK(4096)，NMS 留 CPU | 后处理 15→**3.5ms** | ✅ 已测：E2E 77.8→**64.3ms**，AP 与 base 完全一致；全量口径 63.3ms（动态 18000） |
 | **Ascend 融合预处理算子（方案 A）** | FOV+mask+voxelize 单 AscendC kernel | 前处理 42→~5-10ms | 最可靠压 E2E；需写 kernel |
-| **M≥18000 动态/静态 OM** | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force`） |
+| **M≥18000 动态/静态 OM** | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force` / `fp16_dynamic18000_topk`） |
 | 跨帧流水线 | async D2H 与下帧预处理重叠 | 只提 FPS | 单帧延迟无益 |
 
 ### 性能收益预估
@@ -151,11 +200,14 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 ## 8. 测速方法
 
 ```bash
-# 单帧 demo（含前/后处理，000008 pad 到 9000）
+# 单帧 demo（含前/后处理，000008 pad 到 9000）——注意 demo 无 FOV，体素化 122555 点
 python npu/om_ref_demo.py --om weights/pointpillar_base_fp32_static9000_v2.om
 
-# E2E 分段计时（200 帧，输出 前处理/推理/后处理 拆分 + 官方 AP）
-python npu/om_ref_test.py --om weights/pointpillar_base_fp32_static9000_v2.om --frames 200
+# 单帧完整推理延迟（topk 动态，~93ms；含 getitem 体素化）
+python npu/om_ref_demo.py --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om
+
+# E2E 分段计时（200 帧，输出 前处理/推理/后处理 拆分 + 官方 AP）——有 FOV 过滤口径
+python npu/om_ref_test.py --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om --frames 200
 
 # 只看简化计时（跳过官方评测）
 python npu/om_ref_test.py --om weights/pointpillar_base_fp32_static9000_v2.om --frames 50 --quick

@@ -8,6 +8,17 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ P2 topk 图内化已全量口径验证（2026-09-28）
+
+- **topk OM**：`pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om`（图内 ReduceMax+TopK(4096)+
+  Gather，输出 `topk_boxes (1,4096,7)`/`topk_cls (1,4096,3)`，D2H 13MB→164KB，无 ArgMax/NMS）。
+- **精度**：200 帧 AP 与 base **逐位一致**（Car 77.81 / Ped 59.86 / Cyc 38.32；全量口径 77.07/51.93/61.95）。
+- **性能**（全量口径 200 帧）：后处理 11.8→**4.0ms**，推理 21.3→22.0，E2E 67.5→**63.3ms/帧**。
+- **单帧 demo 完整推理**（无 FOV，000008）：base 109ms → **topk 93ms**（getitem 体素化 122555 点占 58%）。
+- **三种口径澄清**：demo 单帧完整（无 FOV）93ms / 推理链路（不含体素化）~39ms / 数据集全量（有 FOV）63.3ms。
+- `om_ref_demo/test` 无需改码（2 输出 → base_mode 自动适配 4096）。
+- PERFORMANCE.md 更新：新增 1.3 单帧完整延迟、1.4 topk 全量验证、topk OM 转换命令。
+
 ### ✅ P0' 已完成（2026-09-22）：msit 新增通用 knowledge `KnowledgeScatterNdToConcat`
 
 - **根因**（profiler1 定位）：dense head 方向角修正 `box_preds[...,6] = dir_rot+...` 被 v2 导出追成
