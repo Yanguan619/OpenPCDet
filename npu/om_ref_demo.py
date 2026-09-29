@@ -28,6 +28,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# 设备常驻管线（voxelization 输出保持 NPU tensor 直通 feeds）：默认开启，
+# NPU_VOX_DEVICE_RESIDENT=0 可回退 numpy 路径做 A/B。必须在 import npu_patch 前设置。
+os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
 import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 import aclruntime
@@ -119,7 +122,16 @@ class DemoDataset(DatasetTemplate):
 # ============================================================
 
 def to_tensor(x):
-    return torch.from_numpy(x) if isinstance(x, np.ndarray) else x.cpu()
+    """ndarray → CPU tensor；tensor 原样返回（设备常驻模式下为 NPU tensor，不再强制 .cpu()）。"""
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+    if isinstance(x, torch.Tensor):
+        return x
+    return x
+
+
+def _is_npu_tensor(x):
+    return isinstance(x, torch.Tensor) and getattr(x, 'is_npu', False)
 
 
 def collate_batch_fast(batch_list):
@@ -136,6 +148,21 @@ def collate_batch_fast(batch_list):
     """
     if len(batch_list) == 1:
         dd = batch_list[0]
+        if any(_is_npu_tensor(v) for v in dd.values()):
+            # 设备常驻模式：voxels/coords/num_points 为 NPU tensor —— torch 单帧
+            # fast path（引用 + F.pad 补 batch 列，全 device 侧无 host 往返），
+            # 语义与 npu_patch 的 tensor-aware collate 一致（单帧 batch idx=0）。
+            ret = {}
+            for key, val in dd.items():
+                if key in ('voxels', 'voxel_num_points', 'points'):
+                    ret[key] = val  # 单帧无 batch 维，直接引用（只读消费）
+                elif key == 'voxel_coords':
+                    ret[key] = torch.nn.functional.pad(
+                        val, (1, 0), mode='constant', value=0)
+                else:
+                    ret[key] = np.stack([val], axis=0)
+            ret['batch_size'] = 1
+            return ret
         ret = {}
         for key, val in dd.items():
             if key in ('voxels', 'voxel_num_points'):
@@ -196,8 +223,22 @@ def fov_filter_fused(points, calib, img_shape):
 
 
 def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
-    """构造 PointPillarScatter 的 Gather 索引表 (G,) int64（pad 行号 = pad，默认 = M）。"""
-    coords = voxel_coords.numpy() if hasattr(voxel_coords, 'numpy') else voxel_coords
+    """构造 PointPillarScatter 的 Gather 索引表 (G,) int64（pad 行号 = pad，默认 = M）。
+
+    NPU 常驻 tensor 走纯 torch 路径（device 侧构造，省 D2H→numpy scatter→H2D
+    往返，实测 0.27ms vs numpy 路径含 host 往返）；整数算术与 numpy 路程
+    逐位一致（voxel 坐标唯一，无重复索引写入）。注意 CPU tensor 必须走 numpy
+    路径：本机 aarch64 的 torch CPU index_put_ 慢路径 ~9ms（numpy 仅 0.2ms）。
+    """
+    if isinstance(voxel_coords, torch.Tensor) and getattr(voxel_coords, 'is_npu', False):
+        coords = voxel_coords.to(torch.int64)
+        indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
+        G = nx * ny * nz
+        pad = M if pad is None else pad
+        index_map = torch.full((G,), pad, dtype=torch.int64, device=coords.device)
+        index_map[indices] = torch.arange(M, dtype=torch.int64, device=coords.device)
+        return index_map
+    coords = voxel_coords.numpy() if isinstance(voxel_coords, torch.Tensor) else voxel_coords
     indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
     G = nx * ny * nz
     pad = M if pad is None else pad
@@ -219,20 +260,32 @@ def pad_to_static_m(voxels, voxel_num_points, voxel_coords, m_target):
     bev_index_map Gather 路径）。返回 (voxels, num_points, coords, index_map)。
 
     缓冲复用：pad 目标固定时复用模块级预分配缓冲（原地清零 + 拷贝），
-    输出数值与 torch.cat 版逐位一致。
+    输出数值与 torch.cat 版逐位一致。输入为 NPU tensor 时缓冲也在 NPU
+    （设备常驻模式，清零/拷贝在 device 侧完成，无 host 往返）。
     """
     M = voxels.shape[0]
     if M > m_target:
         raise ValueError("M=%d > 静态 OM M=%d，超出范围" % (M, m_target))
     if M < m_target:
-        key = (m_target, *tuple(voxels.shape[1:]), voxel_coords.shape[1])
+        key = (m_target, *tuple(voxels.shape[1:]), voxel_coords.shape[1],
+               str(voxels.device) if isinstance(voxels, torch.Tensor) else 'cpu')
         bufs = _PAD_BUFS.get(key)
         if bufs is None:
-            bufs = (
-                torch.zeros((m_target, *voxels.shape[1:]), dtype=voxels.dtype),
-                torch.zeros((m_target,), dtype=voxel_num_points.dtype),
-                torch.zeros((m_target, voxel_coords.shape[1]), dtype=voxel_coords.dtype),
-            )
+            if isinstance(voxels, torch.Tensor):
+                bufs = (
+                    torch.zeros((m_target, *voxels.shape[1:]), dtype=voxels.dtype,
+                                device=voxels.device),
+                    torch.zeros((m_target,), dtype=voxel_num_points.dtype,
+                                device=voxel_num_points.device),
+                    torch.zeros((m_target, voxel_coords.shape[1]), dtype=voxel_coords.dtype,
+                                device=voxel_coords.device),
+                )
+            else:
+                bufs = (
+                    torch.zeros((m_target, *voxels.shape[1:]), dtype=voxels.dtype),
+                    torch.zeros((m_target,), dtype=voxel_num_points.dtype),
+                    torch.zeros((m_target, voxel_coords.shape[1]), dtype=voxel_coords.dtype),
+                )
             _PAD_BUFS[key] = bufs
         bv, bn, bc = bufs
         bv.zero_()
@@ -245,6 +298,41 @@ def pad_to_static_m(voxels, voxel_num_points, voxel_coords, m_target):
     # 索引表只由真实行（前 M 个）构造，pad 值 = m_target
     index_map = build_index_map(voxel_coords[:M], M=M, pad=m_target)
     return voxels, voxel_num_points, voxel_coords, index_map
+
+
+def coords_int32(x):
+    """voxel_coords → int32（tensor / ndarray 双态）。"""
+    if isinstance(x, torch.Tensor):
+        return x.to(torch.int32)
+    return x.astype(np.int32)
+
+
+def mkfeeds(voxels, voxel_num_points, voxel_coords, bev_index_map, device):
+    """构造 OM 输入 feeds。
+
+    NPU 常驻 tensor（设备常驻模式）用 aclruntime.BaseTensor 直接包设备内存
+    （零拷贝，实测与 Tensor(numpy)+to_device 路径输出 bit 一致）；CPU
+    tensor / ndarray 走原 Tensor(host)+to_device 路径。
+
+    ⚠️ 交给 aclruntime 前必须 torch.npu.synchronize()：collate/index_map 的
+    torch NPU op 是异步 enqueue，GE 不在 torch 流上、不会等它——不同步则 GE
+    读到未写完的 device 内存（demo 实测稳定 0 框的根因）。同步约 0.05ms，
+    这些等待本来就要发生，只是显式化。
+    """
+    fs = []
+    dev_resident = any(isinstance(t, torch.Tensor) and getattr(t, 'is_npu', False)
+                       for t in (voxels, voxel_num_points, voxel_coords, bev_index_map))
+    if dev_resident:
+        torch.npu.synchronize()
+    for t in (voxels, voxel_num_points, voxel_coords, bev_index_map):
+        if dev_resident:
+            fs.append(aclruntime.BaseTensor(t.data_ptr(), t.numel() * t.element_size()))
+        else:
+            arr = t.numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
+            ft = aclruntime.Tensor(np.ascontiguousarray(arr))
+            ft.to_device(device)
+            fs.append(ft)
+    return fs
 
 
 def tensor_to_numpy(t, dtype, copy=True):
@@ -537,6 +625,10 @@ def main():
     args, cfg = parse_config()
     logger = common_utils.create_logger()
     logger.info('-----------------Quick Demo of OpenPCDet (OM)-------------------------')
+    # 必修：demo/bench 此前从不调用 torch.npu.set_device，patched generate() 的
+    # .npu() 走默认 device 0，与 session 的 args.device 错位（跨设备访问/错设备占用）。
+    if getattr(torch, 'npu', None) is not None and torch.npu.is_available():
+        torch.npu.set_device(args.device)
     demo_dataset = DemoDataset(
         dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES, training=False,
         root_path=resolve_path(args.data_path), ext=args.ext, logger=logger
@@ -570,7 +662,7 @@ def main():
 
         voxels = to_tensor(data_dict['voxels'])
         voxel_num_points = to_tensor(data_dict['voxel_num_points'])
-        voxel_coords = to_tensor(data_dict['voxel_coords'].astype(np.int32))
+        voxel_coords = to_tensor(coords_int32(data_dict['voxel_coords']))
         M = voxels.shape[0]
         if expect_m is not None and expect_m > 0:
             # 静态 shape OM：M < 固定值时 pad，M 超限则跳过
@@ -585,14 +677,7 @@ def main():
         else:
             bev_index_map = build_index_map(voxel_coords, M=M)
 
-        feeds = [
-            aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
-            aclruntime.Tensor(np.ascontiguousarray(voxel_num_points.numpy())),
-            aclruntime.Tensor(np.ascontiguousarray(voxel_coords.numpy())),
-            aclruntime.Tensor(np.ascontiguousarray(bev_index_map.numpy())),
-        ]
-        for t in feeds:
-            t.to_device(args.device)
+        feeds = mkfeeds(voxels, voxel_num_points, voxel_coords, bev_index_map, args.device)
         if expect_m is not None and expect_m <= 0:
             # 动态 shape OM：运行时指定实际 shape + 输出缓存
             dym = []

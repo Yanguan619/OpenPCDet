@@ -194,6 +194,10 @@ def main():
         "[init] session 加载 %s (frames %d 起始=%d 终止=%d)\n" % (args.om, len(sample_ids), args.start, end)
     )
     sys.stdout.flush()
+    # 必修：与 demo/bench 一致——patched generate() 的 .npu() 默认走 device 0，
+    # 必须与 args.device 对齐，否则体素化算子与 OM session 跨设备错位。
+    if getattr(torch, 'npu', None) is not None and torch.npu.is_available():
+        torch.npu.set_device(args.device)
     session = InferenceSession(args.om, args.device, aclruntime.session_options())
     out_names = [d.name for d in session.get_outputs()]
     expect_m = session.get_inputs()[0].shape[0]

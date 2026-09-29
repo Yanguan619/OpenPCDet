@@ -4,6 +4,7 @@
     BENCH_DEVICE=1 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
     BENCH_OM=/path/to/model.om BENCH_DEVICE=2 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
     # BENCH_OM 覆盖 OM 路径（默认原值）；静态 OM（expect_m>0）自动走 pad 分支
+    # NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线（回退 numpy 路径做 A/B）
 """
 import os
 import sys
@@ -12,6 +13,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+# 设备常驻管线：voxelization 输出保持 NPU tensor（collate/index_map/feeds 全程
+# device 侧），消除 D2H→numpy→collate→H2D 往返。须在 import npu_patch 前设置。
+os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
 import npu.npu_patch  # noqa: E402,F401  预注入 stub，必须在 import pcdet 之前
 
 import aclruntime
@@ -23,7 +27,7 @@ from pcdet.utils import common_utils
 
 from npu.om_ref_demo import (DemoDataset, to_tensor, build_index_map, pad_to_static_m,
                              tensor_to_numpy, nms_topk_numpy, collate_batch_fast,
-                             postprocess_topk)
+                             postprocess_topk, mkfeeds, coords_int32)
 
 OM = Path(os.environ.get('BENCH_OM', ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om'))
 BIN = ROOT / '000008.bin'
@@ -34,6 +38,10 @@ SKIP = 3  # 预热帧不计入统计
 
 
 def main():
+    # 必修：patched generate() 的 .npu() 默认走 device 0，必须与 BENCH_DEVICE
+    # 对齐（否则算子跑在 device 0、OM 跑在 device 1，跨设备错位）。
+    if getattr(torch, 'npu', None) is not None and torch.npu.is_available():
+        torch.npu.set_device(DEVICE)
     os.chdir(str(ROOT / 'tools'))  # 与 demo 一致：_BASE_CONFIG_ 相对 tools/ 解析
     cfg_from_yaml_file(str(CFG), cfg)
     logger = common_utils.create_logger()
@@ -79,32 +87,23 @@ def main():
         data_dict = timed('3.collate_batch', lambda: collate_batch_fast([dd]), rec)
 
         def voxelize_tensors():
-            # 纯 numpy：data_dict 里的数组本就是 numpy，跳过 to_tensor / astype 往返
-            voxels = data_dict['voxels']          # (M, 32, 4) float32
-            vnp = data_dict['voxel_num_points']   # (M,) int32
-            vco = data_dict['voxel_coords']       # (M, 4) int32（含 batch 列）
+            # 双态：设备常驻模式下 data_dict 里是 NPU tensor（to_tensor 直通），
+            # numpy 模式下 from_numpy 视图，代价可忽略
+            voxels = to_tensor(data_dict['voxels'])
+            vnp = to_tensor(data_dict['voxel_num_points'])
+            vco = to_tensor(coords_int32(data_dict['voxel_coords']))
             if is_dynamic:
-                bim = build_index_map(vco, M=voxels.shape[0]).numpy()
+                bim = build_index_map(vco, M=voxels.shape[0])
             else:
                 if voxels.shape[0] > expect_m:
                     raise RuntimeError('M=%d 超过静态 OM M=%d' % (voxels.shape[0], expect_m))
-                voxels, vnp, vco, bim = pad_to_static_m(
-                    to_tensor(voxels), to_tensor(vnp), to_tensor(vco), expect_m)
-                voxels, vnp, vco = voxels.numpy(), vnp.numpy(), vco.numpy()
-                bim = bim.numpy()
+                voxels, vnp, vco, bim = pad_to_static_m(voxels, vnp, vco, expect_m)
             return voxels, vnp, vco, bim
         voxels, vnp, vco, bim = timed('4.tensor+index_map/pad', voxelize_tensors, rec)
         M = voxels.shape[0]
 
-        def mkfeeds():
-            fs = [aclruntime.Tensor(np.ascontiguousarray(voxels)),
-                  aclruntime.Tensor(np.ascontiguousarray(vnp)),
-                  aclruntime.Tensor(np.ascontiguousarray(vco)),
-                  aclruntime.Tensor(np.ascontiguousarray(bim))]
-            for t in fs:
-                t.to_device(DEVICE)
-            return fs
-        feeds = timed('5.feeds构造+to_device(H2D)', mkfeeds, rec)
+        feeds = timed('5.feeds构造+to_device(H2D)',
+                      lambda: mkfeeds(voxels, vnp, vco, bim, DEVICE), rec)
 
         if is_dynamic:
             def setdym():

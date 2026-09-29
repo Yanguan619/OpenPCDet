@@ -77,6 +77,16 @@ def _patch_voxelize_ascendc():
                 max_num_points=self.max_num_points,
                 max_voxels=self.max_voxels,
             )
+            if _VOX_DEVICE_RESIDENT:
+                # 设备常驻：输出保持 NPU tensor（下游 collate/index_map/feeds 由
+                # 配套 patch 走 torch/aclruntime.BaseTensor 路径），消除
+                # D2H→numpy→H2D 往返。coords 的 (x,y,z)→(z,y,x) 换列在 device
+                # 侧完成，值与 numpy 版逐位一致。
+                return {
+                    'voxels': out.voxels,
+                    'coordinates': out.coords[:, [2, 1, 0]].contiguous(),
+                    'num_points_per_voxel': out.num_points,
+                }
             return {
                 'voxels': out.voxels.cpu().numpy(),
                 'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
@@ -96,6 +106,150 @@ def _patch_voxelize_ascendc():
 _VOXELIZE_PATCHED = False
 _VOX_FALLBACK_WARNED = False
 _VOX_ORIG_GENERATE = None
+
+# 设备常驻模式：voxelization 输出以 NPU tensor 直通 collate/index_map/feeds，
+# 消除 D2H→numpy→collate 拷贝→H2D 往返（省 ~4-5ms）。由调用脚本在 import 本模块
+# 前设置 NPU_VOX_DEVICE_RESIDENT=1 开启（默认关：其余脚本保持 numpy 契约不变）。
+_VOX_DEVICE_RESIDENT = os.environ.get('NPU_VOX_DEVICE_RESIDENT', '0') == '1'
+
+
+# ---------------------------------------------------------------------------
+# mask_points_and_boxes_outside_range 的 numba 单遍实现（值与 numpy 版逐位一致）。
+#
+# OpenPCDet 原版（common_utils.mask_points_by_range 生成 bool mask + 调用方
+# fancy index gather）在本机 aarch64 上 ~3.2ms/帧：6 次全数组比较 + 5 次 and
+# 产生多份临时，再布尔 gather；numba 单遍「判界 + 原地压缩」~0.3ms（-2.9ms）。
+# 比较语义与 common_utils.mask_points_by_range 完全一致：只比 x/y（原版不含
+# z），>= / <= 边界一致，行序保持原始顺序 → 输出逐位一致。gt_boxes 分支保持
+# 原逻辑（demo 无 gt_boxes，训练路径不受影响）。NPU_NUMBA_MASK=0 关闭。
+# ---------------------------------------------------------------------------
+def _patch_mask_points_by_range():
+    if os.environ.get('NPU_NUMBA_MASK', '1') != '1':
+        return
+    try:
+        import numba
+        from functools import partial
+        from pcdet.datasets.processor import data_processor as dp_mod
+        from pcdet.utils import box_utils, common_utils
+    except Exception:
+        return
+    if getattr(dp_mod.DataProcessor.mask_points_and_boxes_outside_range,
+               '_unum_numba_mask', False):
+        return
+
+    @numba.njit(cache=True)
+    def _mask_compact(pts, lim, out):
+        n = pts.shape[0]
+        c = pts.shape[1]
+        cnt = 0
+        for i in range(n):
+            x = pts[i, 0]
+            y = pts[i, 1]
+            if (x >= lim[0] and x <= lim[3]) and (y >= lim[1] and y <= lim[4]):
+                for j in range(c):
+                    out[cnt, j] = pts[i, j]
+                cnt += 1
+        return cnt
+
+    def _npy_mask_compact(points, point_cloud_range):
+        try:
+            pts = np.ascontiguousarray(points, dtype=np.float32)
+            lim = np.asarray(point_cloud_range, dtype=np.float32)
+            out = np.empty_like(pts)
+            cnt = _mask_compact(pts, lim, out)
+            return out[:cnt]
+        except Exception:
+            return points[common_utils.mask_points_by_range(points, point_cloud_range)]
+
+    def _mask_and_boxes_outside_range(self, data_dict=None, config=None):
+        if data_dict is None:
+            return partial(self.mask_points_and_boxes_outside_range, config=config)
+        if data_dict.get('points', None) is not None:
+            data_dict['points'] = _npy_mask_compact(
+                data_dict['points'], self.point_cloud_range)
+        if (data_dict.get('gt_boxes', None) is not None
+                and config.REMOVE_OUTSIDE_BOXES and self.training):
+            mask = box_utils.mask_boxes_outside_range_numpy(
+                data_dict['gt_boxes'], self.point_cloud_range,
+                min_num_corners=config.get('min_num_corners', 1),
+                use_center_to_filter=config.get('USE_CENTER_TO_FILTER', True),
+            )
+            data_dict['gt_boxes'] = data_dict['gt_boxes'][mask]
+        return data_dict
+
+    _mask_and_boxes_outside_range._unum_numba_mask = True
+    dp_mod.DataProcessor.mask_points_and_boxes_outside_range = _mask_and_boxes_outside_range
+
+
+# ---------------------------------------------------------------------------
+# 设备常驻模式的 collate_batch：torch.Tensor 走 torch.cat / F.pad（与 numpy 版
+# 逐位一致），numpy 值仍走原逻辑。仅覆盖 demo/推理链路的 key 集合，其余 key 无
+# tensor 时整批委托原实现。
+# ---------------------------------------------------------------------------
+def _patch_collate_tensor_aware():
+    if not _VOX_DEVICE_RESIDENT:
+        return
+    try:
+        from pcdet.datasets import DatasetTemplate
+    except Exception:
+        return
+    if getattr(DatasetTemplate.collate_batch, '_unum_tensor_aware', False):
+        return
+    _orig = DatasetTemplate.collate_batch
+
+    def _collate(batch_list, _unused=False):
+        has_tensor = any(isinstance(v, torch.Tensor)
+                         for s in batch_list for v in s.values())
+        if not has_tensor:
+            return _orig(batch_list, _unused)
+        from collections import defaultdict
+        data_dict = defaultdict(list)
+        for cur_sample in batch_list:
+            for key, val in cur_sample.items():
+                data_dict[key].append(val)
+        batch_size = len(batch_list)
+        ret = {}
+        batch_size_ratio = 1
+        for key, val in data_dict.items():
+            try:
+                if key in ['voxels', 'voxel_num_points']:
+                    if isinstance(val[0], list):
+                        batch_size_ratio = len(val[0])
+                        val = [i for item in val for i in item]
+                    if isinstance(val[0], torch.Tensor):
+                        ret[key] = torch.cat(val, dim=0)
+                    else:
+                        ret[key] = np.concatenate(val, axis=0)
+                elif key in ['points', 'voxel_coords']:
+                    coors = []
+                    if isinstance(val[0], list):
+                        val = [i for item in val for i in item]
+                    for i, coor in enumerate(val):
+                        if isinstance(coor, torch.Tensor):
+                            coors.append(torch.nn.functional.pad(
+                                coor, (1, 0), mode='constant', value=i))
+                        else:
+                            coors.append(np.pad(coor, ((0, 0), (1, 0)),
+                                                mode='constant', constant_values=i))
+                    if isinstance(val[0], torch.Tensor):
+                        ret[key] = torch.cat(coors, dim=0)
+                    else:
+                        ret[key] = np.concatenate(coors, axis=0)
+                elif key in ['calib']:
+                    ret[key] = val
+                elif isinstance(val[0], torch.Tensor):
+                    ret[key] = torch.stack(val, dim=0)
+                else:
+                    ret[key] = np.stack(val, axis=0)
+            except Exception:
+                print('Error in collate_batch: key=%s' % key)
+                raise TypeError
+        ret['batch_size'] = batch_size * batch_size_ratio
+        return ret
+
+    _collate._unum_tensor_aware = True
+    DatasetTemplate.collate_batch = staticmethod(_collate)
+
 
 _F32 = np.float32
 
@@ -771,8 +925,14 @@ patch_cuda_ops()
 # 生产链路（om_ref_demo/om_ref_test/om_ref_test_pt 等）只 import 本模块、不调 init_patch()，
 # 故在此 import 时即：① alias spconv→unum_ops shim（否则顶层 spconv 与 unum_ops.spconv 是两份拷贝，
 # patch 打不到消费者用的类）；② 启用 AscendC 体素化；NPU_ASCENDC_VOXELIZE=0 可关闭（自动回退 CPU numba）。
+# ③ numba 单遍 mask（值与原版逐位一致，NPU_NUMBA_MASK=0 关闭）；
+# ④ 设备常驻 collate（NPU_VOX_DEVICE_RESIDENT=1 时启用 tensor-aware collate_batch）。
+# ①②③ 必须在任意 DataProcessor/DemoDataset 构造之前生效（processor 以 partial
+# 捕获 bound method，晚 patch 不会命中已创建的实例）。
 _alias_spconv()
 _patch_voxelize_ascendc()
+_patch_mask_points_by_range()
+_patch_collate_tensor_aware()
 
 
 class PPWrapper(torch.nn.Module):
