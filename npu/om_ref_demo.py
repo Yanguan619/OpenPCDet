@@ -528,12 +528,14 @@ def main():
         else:
             bev_index_map = build_index_map(voxel_coords, M=M)
 
-        feeds = {
-            "voxels": aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
-            "voxel_num_points": aclruntime.Tensor(np.ascontiguousarray(voxel_num_points.numpy())),
-            "voxel_coords": aclruntime.Tensor(np.ascontiguousarray(voxel_coords.numpy())),
-            "bev_index_map": aclruntime.Tensor(np.ascontiguousarray(bev_index_map.numpy())),
-        }
+        feeds = [
+            aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
+            aclruntime.Tensor(np.ascontiguousarray(voxel_num_points.numpy())),
+            aclruntime.Tensor(np.ascontiguousarray(voxel_coords.numpy())),
+            aclruntime.Tensor(np.ascontiguousarray(bev_index_map.numpy())),
+        ]
+        for t in feeds:
+            t.to_device(args.device)
         if expect_m is not None and expect_m <= 0:
             # 动态 shape OM：运行时指定实际 shape + 输出缓存
             dym = []
