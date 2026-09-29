@@ -8,6 +8,48 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ export_onnx 数据集无关化 + 补全 Ascend 图改写环节（2026-09-29）
+
+- **背景**：转换链此前依赖 KITTI 数据集（`--sample-idx` 走 KittiDataset 取真实样本），且验证中发现
+  **README 记载的链无法从 ckpt 复现既有 OM**——既有 v2 产物（`pointpillar_nms_base_v2_dynamic_topk.onnx`）
+  实际经过了 msit 两个自定义 knowledge 的图改写（P0' ScatterND 消除 / P1' ArgMax 消除），该环节
+  从未在仓库链路中（历史产物靠旧机器上的手工 auto_optimizer 调用生成；本机 msit 为后来重新克隆，
+  knowledge 一度丢失，本次从 gitcode fork `surgeon-only` 分支 `81c4aa6` 拉回）。
+- **改动（export_onnx.py）**：
+  - 模型构建改用 `DatasetTemplate`（纯配置派生 grid_size / point_cloud_range / voxel_size /
+    num_point_features，不加载 infos/点云；`Detector3DTemplate` 只用到这几个属性）；
+    导出输入改为按接口规格合成的 dummy 张量（M=`--export-m` 默认 12000，BEV 格点索引唯一，
+    bev_index_map 复用 `build_index_map` 的 pad=M 语义）。删除 `--sample-idx`；
+    默认 `--config` 改为 git 内的 `tools/cfgs/kitti_models/pointpillar.yaml`（`_BASE_CONFIG_`
+    相对 tools/ 解析，解析期间临时 chdir）。
+  - 新增 **Step 1.5 `ascend_rewrite()`（必经、幂等、无开关）**：调 msit onnx_optimizer 的
+    `KnowledgeScatterNdToConcat` + `KnowledgeArgMax2ToCompare`（ScatterND→Slice+Concat、
+    ArgMax→Greater+Cast，均 bit 级一致），未匹配/残留即硬报错；`OnnxGraph.parse` 顺带完成
+    Constant 节点→initializer 归一化（旧 v2 图 0 Constant 的来源）；仅实际应用时落盘
+    （幂等重跑不扰动已改写 base 的字节）。
+  - **修复 `fix_dir_reshape_dim` 静默失效**：torch 2.7 导出的 Reshape 目标是 Constant 节点
+    而非 initializer，原实现只替换 initializer → 从未生效（ArgMax 输入 shape 推断一直是 unk，
+    P1' 当年靠 auto_optimizer 往返把目标变成 initializer 才偶然通过）；现两种形式均原地替换，
+    另修 protobuf 派生数组只读（先取可写副本）。
+  - 推荐链改为 `--dynamic --topk-only --surgery ABC`（**去掉 `--fold-bn`**，对齐已验证 OM 的
+    图口径——既有 OM 未折叠 BN；`--fold-bn` 保留为可选项，置于图改写之后可正常工作，
+    此前在 raw 图（Constant 节点形态）上会触发 onnx checker SSA 报错）。
+- **msit 侧配套修复**（fork `surgeon-only` 已推送 `a495389bf`/`93eb45087`）：`knowledge_scatter_nd_to_concat.py`
+  尾列切片带冒号导致 numpy 2.x 下 `int(ch[0,0])` 抛 TypeError（原机器 pin numpy 1.26.4 未暴露），
+  且 (P,K,1) 与 (1,K) 比较广播错位——去冒号一并修正；`graph_optimizer/optimizer.py` 的
+  `logger.warning(exc)` 传异常对象会被 msit logger 的 `.replace()` 吞掉真实栈（本次排障被坑），
+  改为字符串。
+- **验证（新链 vs 既有产物链）**：
+  - 图结构**同构**：234 节点、算子分布逐项相同、IO 签名相同；initializer **逐值一致**，仅
+    2 个 anchor 网格常量差 ≤1 ULP（根因：旧产物在异构机器生成，anchor `torch.arange` 跨
+    torch 构建舍入噪音；**本机模型 init 的 anchors 与新链常量逐位相等**，自洽无缺陷）。
+  - ATC（`PYTHONPATH` 注入解决 atc 内部 `/usr/bin/python3` 无 numpy，README 已记）→ 新 OM，
+    **demo（000008.bin）33 框与已验证 OM 逐位一致**；前向中位 10.77ms vs 10.65ms 持平。
+  - **确定性**：全链复跑 md5 相同（`d8ed9a59…`）；`--skip-export` 幂等路径语义等价
+    （图同构 + initializer 逐值一致）。
+- **意义**：转换链自此**本机/RC 可从 ckpt 一条命令完整复现**（此前依赖历史产物 + 旧机器手工步骤），
+  且不再需要 KITTI 数据集——转换机仅需 ckpt + 模型配置。
+
 ### ✅ 收敛 CUDA ops 降级机制：删 npu_patch 注入链 + ops_native 冗余副本（2026-09-29）
 
 - **背景**：CUDA ops 降级存在**两套并行机制**——① npu_patch 的 `patch_cuda_ops()` 在 import pcdet

@@ -1,5 +1,5 @@
-"""导出 PointPillars ONNX：ckpt → base → (fold-bn) → topk-only → head 图手术，
-一条命令产出推荐 OM 的直接输入 ONNX。
+"""导出 PointPillars ONNX：ckpt → base → Ascend 图改写 → (fold-bn) → topk-only → head 图手术，
+一条命令产出推荐 OM 的直接输入 ONNX（无数据集依赖）。
 
 用法:
     python npu/export_onnx.py                          # base → NMS 后处理图（历史路径）
@@ -7,9 +7,11 @@
     python npu/export_onnx.py --score-thresh 0.1 --iou-thresh 0.01 --max-det 500
 
     # 推荐链（生成 surgery ABC ONNX，ATC 后即 demo/test 的默认 OM）：
-    python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
+    #   无数据集依赖——模型构建走纯配置 DatasetTemplate，输入为按接口规格合成的 dummy 张量；
+    #   Step 1.5 自动做 Ascend 图改写（ScatterND/ArgMaxD 消除，必经）。
+    python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth \
         --base-output weights/pp_base.onnx --output weights/pp_surgery_abc.onnx \
-        --fold-bn --topk-only --surgery ABC
+        --dynamic --topk-only --surgery ABC
 """
 
 import argparse
@@ -66,23 +68,37 @@ def make_const(name, arr):
 # ============================================================
 
 def export_base_onnx(output_path, args):
-    """导出 base ONNX（PPWrapper: 4 输入 → batch_box_preds, batch_cls_preds）。"""
+    """导出 base ONNX（PPWrapper: 4 输入 → batch_box_preds, batch_cls_preds）。
+
+    不依赖 KITTI 数据集：
+    - 模型构建用 DatasetTemplate（仅从 yaml 派生 grid_size / point_cloud_range / voxel_size /
+      num_point_features 等，不加载 infos / 点云；Detector3DTemplate 只用到这些属性）；
+    - 导出输入用按推理接口规格合成的 dummy 张量——tracer 只消费形状与 dtype，数值不会
+      烙进图（initializer 仅模型权重），与真实数据导出等价（图结构同构、NPU demo 33 框
+      逐位一致，见 CHANGELOG 2026-09-29 条目）。
+    """
     import torch
-    import torch.nn as nn
     from torch_npu.contrib import transfer_to_npu
     torch.npu.set_compile_mode(jit_compile=False)
     from pcdet.config import cfg, cfg_from_yaml_file
-    from pcdet.datasets import KittiDataset
+    from pcdet.datasets import DatasetTemplate
     from pcdet.utils import common_utils
     from pcdet.models.detectors.pointpillar import PointPillar
 
-    cfg_from_yaml_file(args.config, cfg)
+    # _BASE_CONFIG_ 的相对路径以上游 tools/ 为基准（与 pcdet 脚本的运行目录约定一致）
+    import os
+    _old_cwd = os.getcwd()
+    os.chdir(ROOT / "tools")
+    try:
+        cfg_from_yaml_file(args.config, cfg)
+    finally:
+        os.chdir(_old_cwd)
     logger = common_utils.create_logger()
-    demo_dataset = KittiDataset(
-        dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
-        training=False, logger=logger,
-    )
 
+    demo_dataset = DatasetTemplate(
+        dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
+        training=False, root_path=Path("."), logger=logger,
+    )
     model = PointPillar(
         model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=demo_dataset
     )
@@ -92,29 +108,27 @@ def export_base_onnx(output_path, args):
     for p in model.parameters():
         p.requires_grad_(False)
 
-    data_dict = demo_dataset[demo_dataset.sample_id_list.index(args.sample_idx)]
-    data_dict = demo_dataset.collate_batch([data_dict])
-    for key, val in data_dict.items():
-        if not isinstance(val, np.ndarray):
-            continue
-        elif key in ["frame_id", "metadata", "calib"]:
-            continue
-        elif key in ["images"]:
-            data_dict[key] = torch.from_numpy(val).float().npu().contiguous()
-        elif key in ["image_shape"]:
-            data_dict[key] = torch.from_numpy(val).int().npu()
-        else:
-            data_dict[key] = torch.from_numpy(val).npu()
+    # ---- 合成输入（形状/dtype 与推理接口一致；scatter 的 Gather 要求 BEV 格点索引唯一）----
+    M = args.export_m
+    nx, ny, nz = (int(v) for v in demo_dataset.grid_size)
+    if M > nx * ny * nz:
+        raise SystemExit("--export-m %d 超过 BEV 格点数 %d（coords 无法保持唯一）" % (M, nx * ny * nz))
+    idx = np.arange(M)
+    coords_np = np.zeros((M, 4), dtype=np.int32)       # [batch, x, y, z]
+    coords_np[:, 1] = idx % nx                         # x ∈ [0, nx)
+    coords_np[:, 2] = (idx // nx) % ny                 # y ∈ [0, ny)
+    # z 恒 0（nz=1）、batch 恒 0 —— 与真实单帧一致
 
-    voxels = data_dict["voxels"]
-    voxel_num_points = data_dict["voxel_num_points"]
-    voxel_coords = data_dict["voxel_coords"]
-    M = voxels.shape[0]
-    coords_np = voxel_coords.cpu().numpy()
-    indices = coords_np[:, 1] + coords_np[:, 2] * 432 + coords_np[:, 3]
-    index_map = np.full(432 * 496, M, dtype=np.int64)
-    index_map[indices.astype(np.int64)] = np.arange(M, dtype=np.int64)
-    bev_index_map = torch.from_numpy(index_map).npu()
+    voxels = torch.randn(M, 32, 4)                     # float32 (M, 32, 4)
+    voxel_num_points = torch.randint(1, 33, (M,), dtype=torch.int32)
+    voxel_coords = torch.from_numpy(coords_np)         # int32 (M, 4)
+    bev_index_map = npu.npu_patch.build_index_map(     # int64 (G,)，空位 = M（pad 行语义）
+        voxel_coords, nx=nx, ny=ny, nz=nz)
+
+    voxels = voxels.npu()
+    voxel_num_points = voxel_num_points.npu()
+    voxel_coords = voxel_coords.npu()
+    bev_index_map = bev_index_map.npu()
 
     wrapper = PPWrapper(model)
     dynamic_axes = None
@@ -139,7 +153,7 @@ def export_base_onnx(output_path, args):
         dynamic_axes=dynamic_axes,
     )
     fix_dir_reshape_dim(output_path, num_dir_bins=cfg.MODEL.DENSE_HEAD.NUM_DIR_BINS)
-    print("base ONNX -> %s" % output_path, flush=True)
+    print("base ONNX -> %s（合成输入 M=%d，无数据集依赖）" % (output_path, M), flush=True)
 
 
 def fix_dir_reshape_dim(output_path, num_dir_bins):
@@ -178,21 +192,70 @@ def fix_dir_reshape_dim(output_path, num_dir_bins):
         tgt = target_arr(resh.input[1])
         if tgt is None or -1 not in tgt:
             continue
+        tgt = np.array(tgt)  # protobuf 派生数组只读，取可写副本后再改
         n = tgt.shape[0]
         ax = axis + n if axis < 0 else axis
         if not (0 <= ax < n and tgt[ax] == -1):
             continue
         tgt[ax] = int(num_dir_bins)
         new_init = _nh.from_array(tgt, resh.input[1])
+        replaced = False
         for i, init in enumerate(g.initializer):
             if init.name == resh.input[1]:
-                del g.initializer[i]
-                g.initializer.insert(i, new_init)
-                changed = True
+                g.initializer[i].CopyFrom(new_init)
+                replaced = True
                 break
+        if not replaced:
+            # torch 2.7 导出的 Reshape 目标是 Constant 节点（非 initializer），原地改其 value
+            n = prods.get(resh.input[1])
+            if n is not None and n.op_type == "Constant":
+                for a in n.attribute:
+                    if a.name == "value":
+                        a.t.CopyFrom(new_init)
+                        replaced = True
+                        break
+        changed |= replaced
     if changed:
         _onnx.save(model, output_path)
         print("  fix_dir_reshape_dim: patched ArgMax reshape -1 -> %s" % num_dir_bins, flush=True)
+
+
+def ascend_rewrite(onnx_path):
+    """Ascend 图改写（必经步骤，无开关无回退）：消除 310P 单核标量实现的 NPU 不友好算子。
+
+    - KnowledgeScatterNdToConcat：dense head 方向角修正 ``box[..., 6] = dir_rot`` 的 trace 产物
+      ScatterND（单核标量，单帧 ~125ms）→ Slice+Concat（多核向量化），bit 级一致；
+    - KnowledgeArgMax2ToCompare：dir argmax（单核标量，~19ms）→ Greater+Cast，bit 级一致。
+    经 onnx_optimizer（msit，pip editable 安装）执行，同时把 Constant 节点归一化为
+    initializer（OnnxGraph.parse 行为）。
+
+    依赖缺失或 knowledge 未匹配（图结构与预期不符）均硬报错，不静默回退。
+    """
+    from onnx_optimizer.graph_optimizer.optimizer import GraphOptimizer
+    from onnx_optimizer.graph_refactor.onnx.graph import OnnxGraph
+    from onnx_optimizer.pattern.knowledge_factory import KnowledgeFactory
+
+    graph = OnnxGraph.parse(str(onnx_path), add_name_suffix=False)
+    pool = KnowledgeFactory.get_knowledge_pool()
+    applied_any = False
+    for name, op_type in (
+        ("KnowledgeScatterNdToConcat", "ScatterND"),
+        ("KnowledgeArgMax2ToCompare", "ArgMax"),
+    ):
+        if not any(n.op_type == op_type for n in graph.nodes):
+            print("  ascend rewrite: %s 跳过（图中已无 %s，幂等）" % (name, op_type), flush=True)
+            continue
+        knowledge = pool[name]
+        knowledge.reset()
+        if not GraphOptimizer.optimize(graph, knowledge):
+            raise SystemExit("Ascend 图改写失败：%s 未匹配（导出图结构与预期不符）" % name)
+        print("  ascend rewrite: %s 应用成功" % name, flush=True)
+        applied_any = True
+    leftover = sorted({n.op_type for n in graph.nodes if n.op_type in ("ScatterND", "ArgMax")})
+    if leftover:
+        raise SystemExit("Ascend 图改写后仍残留 NPU 不友好算子: %s" % leftover)
+    if applied_any:
+        graph.save(str(onnx_path))
 
 
 # ============================================================
@@ -471,9 +534,11 @@ def add_postproc(base_onnx_path, final_onnx_path, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Export PointPillars ONNX with NMS post-processing")
-    parser.add_argument("--config", default=str(ROOT / "data/config.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "tools/cfgs/kitti_models/pointpillar.yaml"))
     parser.add_argument("--ckpt", default=str(ROOT / "weights/pointpillar_7728.pth"))
-    parser.add_argument("--sample-idx", default="000008")
+    parser.add_argument("--export-m", type=int, default=12000,
+                        help="合成输入的 pillar 数 M（仅决定导出时的形状；建议配合 --dynamic，"
+                             "ATC 用 range 记法覆盖为 1~18000）")
     parser.add_argument("--output", default=str(ROOT / "weights/pointpillar_nms.onnx"))
     parser.add_argument("--base-output", default=str(ROOT / "weights/pointpillar_nms_base.onnx"))
     parser.add_argument("--skip-export", action="store_true", help="复用已有 base ONNX，只做图手术")
@@ -486,7 +551,9 @@ def main():
                         help="topk-only 之上叠加 head 图手术（推荐 ABC；需与 --topk-only 同用）。"
                              "A=合并 1x1 head conv，B=消除冗余 gather，C=ConvTranspose→Conv1x1+DepthToSpace；"
                              "D 已弃用（TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧截断风险）")
-    parser.add_argument("--fold-bn", action="store_true", help="把 BatchNormalization 折叠进 Conv/ConvTranspose（数学精确，提速前向）")
+    parser.add_argument("--fold-bn", action="store_true",
+                        help="可选：把 BatchNormalization 折叠进 Conv/ConvTranspose（数学精确）。"
+                             "默认不开（对齐已验证 OM 的图口径）")
     parser.add_argument("--score-thresh", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.01)
     parser.add_argument("--max-det", type=int, default=500)
@@ -500,8 +567,12 @@ def main():
         print("===== Step 1: 导出 base ONNX =====", flush=True)
         export_base_onnx(base_path, args)
 
+    # 必经且幂等：已改写过的图（无 ScatterND/ArgMax）自动跳过；--skip-export 复用 raw base 时补改写
+    print("===== Step 1.5: Ascend 图改写（ScatterND/ArgMaxD 消除，必经）=====", flush=True)
+    ascend_rewrite(base_path)
+
     if getattr(args, "fold_bn", False):
-        print("===== Step 1.5: BN 折叠进 Conv/ConvTranspose =====", flush=True)
+        print("===== Step 1.6: BN 折叠进 Conv/ConvTranspose =====", flush=True)
         fold_bn_into_conv(base_path)
 
     if getattr(args, "topk_only", False):
@@ -513,7 +584,7 @@ def main():
 
     if getattr(args, "surgery", ""):
         if not getattr(args, "topk_only", False):
-            raise SystemExit("--surgery 仅支持 --topk-only 图（推荐链：--fold-bn --topk-only --surgery ABC）")
+            raise SystemExit("--surgery 仅支持 --topk-only 图（推荐链：--dynamic --topk-only --surgery ABC）")
         print("===== Step 3: head 图手术 %s =====" % args.surgery.upper(), flush=True)
         apply_head_surgery(final_path, args.surgery)
 

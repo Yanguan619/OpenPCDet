@@ -72,6 +72,7 @@ PointPillars 是将 PointNet 直接作用于 pillar（柱体）稀疏体素的 3
   | numpy | ≥1.26 | 2.4.6 | 全链路实测通过 |
   | numba | ≥0.59 | 0.67.0 | mask / FOV / NMS 使用 |
   | onnx | ≥1.16 | 1.16.1 | 仅模型转换（`export_onnx.py`）需要 |
+  | onnx_optimizer（msit） | surgeon-only 分支 | **surgeon-only**（`81c4aa6`） | 必需依赖（模型转换）：Ascend 图改写 knowledge（ScatterND/ArgMax 消除）+ Constant→initializer 归一化 |
 
 > 体素化**固定走 AscendC NPU kernel**（无回退无开关）——unum_ops/OPP 缺失或版本过旧会在 `import npu_patch` 时直接 ImportError，运行期算子异常带栈抛出，**不会静默换 CPU numba**；启动时打印一行当前 voxelize 模式。
 
@@ -122,12 +123,16 @@ npu-smi info
 git clone https://github.com/Yanguan619/unum_ops.git
 cd unum_ops && git checkout bevpool-kernel-opt && pip install -e .
 
-# 2) 若 OPP 未能随 pip 安装（或升级 kernel 后），手动重装：
+# 2) msit onnx_optimizer（模型转换 Step 1.5 的 Ascend 图改写 knowledge，必经无开关）
+git clone https://gitcode.com/Yanguan/msit.git
+cd msit && git checkout surgeon-only && cd onnx_optimizer && pip install -e .
+
+# 3) 若 OPP 未能随 pip 安装（或升级 kernel 后），手动重装：
 bash build.sh --soc=ascend310p -j8 && cd build && \
     bash custom_opp_openEuler_aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp
 ```
 
-OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`），其余依赖（numpy / numba / onnx）按 [推理环境准备](#推理环境准备) 的版本安装即可。
+OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`），其余依赖（numpy / numba / onnx）按 [推理环境准备](#推理环境准备) 的版本安装即可（onnx_optimizer 已在上一步安装）。
 
 ## 获取源码
 
@@ -139,7 +144,7 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
        ├── om_ref_demo.py              # 单帧推理 + 计时（主入口）
        ├── om_ref_test.py              # 全量数据集评测（内嵌官方 KITTI AP）
        ├── om_ref_test_pt.py           # 全量推理（PyTorch 后端，精度对照用）
-       ├── export_onnx.py              # ONNX 导出与图手术一条链（--fold-bn / --topk-only / --surgery ABC）
+       ├── export_onnx.py              # ONNX 导出+Ascend 图改写+图手术一条链（无数据集依赖）
        ├── npu_patch.py                # 设备检测/算子适配统一补丁（体素化固定 AscendC）
        ├── verify_npu.sh               # 环境→补丁→推理→评测 串联验证
        ├── ops_native/                 # 纯 numpy/numba 算子（iou3d NMS 等）
@@ -147,6 +152,8 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
    ```
 
 ## 准备数据集
+
+> 数据集仅**推理 demo / 全量评测**需要；[模型转换](#模型转换ckpt--onnx--om)不依赖数据集，可先行完成。
 
 - **单帧 demo**：任意 velodyne `.bin` 点云（如 `data/kitti/training/velodyne/000008.bin`，默认路径即此）。
 - **全量评测（KITTI val）**：到 [KITTI 3D Object Detection](http://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d)（需注册）下载并组织：
@@ -168,18 +175,22 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
 
 ## 模型转换（ckpt → ONNX → OM）
 
-`weights/` 与 `data/` 不入 git，OM 需自行生成。以下命令从权重一步生成推理脚本的**默认 OM**：
+`weights/` 与 `data/` 不入 git，OM 需自行生成。**转换不依赖 KITTI 数据集**：模型构建走纯配置 `DatasetTemplate`（只从 yaml 派生 grid_size 等标量，不加载任何数据文件），导出输入为按推理接口规格合成的 dummy 张量（tracer 只消费形状/dtype，数值不入图；该链已与真实数据产物验证等价——图结构同构、NPU demo 33 框逐位一致）。以下命令从权重一步生成推理脚本的**默认 OM**：
 
 ```bash
 mkdir -p weights
 
-# (a) ckpt → base ONNX → BN 折叠 → 图内 TopK → head 图手术 ABC，一条命令
-#     （--fold-bn：BN 折叠进卷积；--topk-only：图内 ReduceMax+TopK 4096，后处理 11.8→4ms；
-#      --surgery ABC：数学恒等 head 手术——1x1 head 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS，
-#      不做 D，TopK 保持 4096，输出语义与 topk OM 完全一致）
-python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
+# (a) ckpt → ONNX 一条命令，内部依次：
+#     Step 1   导出 base ONNX（合成输入，无数据集依赖；--dynamic 把 M 维标为动态）
+#     Step 1.5 Ascend 图改写（必经，无开关）：ScatterND→Slice+Concat、ArgMax→Greater+Cast
+#              —— 310P 上 ScatterND/ArgMax 均为单核标量实现（单帧 ~125ms/~19ms），
+#              改写后多核向量化且 bit 级一致；依赖 msit onnx_optimizer 两个 knowledge
+#     Step 2   图内 TopK（ReduceMax+TopK 4096，后处理 11.8→4ms）
+#     Step 3   head 图手术 ABC（数学恒等：1x1 head 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS；
+#              不做 D，TopK 保持 4096，输出语义与 topk OM 完全一致）
+python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth \
     --base-output weights/pp_base.onnx --output weights/pp_surgery_abc.onnx \
-    --fold-bn --topk-only --surgery ABC
+    --dynamic --topk-only --surgery ABC
 
 # (b) ATC 转 OM（需装有 CANN 的机器；--output 名即推理脚本的默认 OM 名）
 atc --model=weights/pp_surgery_abc.onnx --framework=5 --soc_version=Ascend310P3 \
@@ -194,6 +205,12 @@ ATC 精度要点：
 - 动态 shape 用 **range 记法** `voxels:1~18000`，**勿用 `-1`/`--dynamic_dims`**（避免 ATC mbatch 切分报错）。
 - dtype：`voxel_num_points`/`voxel_coords` 为 int32、`bev_index_map` 为 int64，ATC 不可覆盖。
 - `voxel_coords` 经 collate 后是 Fortran 序，喂 OM 前必须 `np.ascontiguousarray`（推理脚本已处理）。
+- 若 `atc` 报 `No module named 'numpy'`（其内部 tbe 组件调用系统 `/usr/bin/python3`，而 numpy 装在当前解释器），前置注入后重试：
+
+  ```bash
+  PYTHONPATH=$(python -c "import site; print(site.getsitepackages()[0])"):$PYTHONPATH \
+      atc --model=weights/pp_surgery_abc.onnx ...   # 其余参数同上
+  ```
 
 ## 模型推理
 
