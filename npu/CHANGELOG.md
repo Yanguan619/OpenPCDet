@@ -8,6 +8,24 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 收敛 CUDA ops 降级机制：删 npu_patch 注入链 + ops_native 冗余副本（2026-09-29）
+
+- **背景**：CUDA ops 降级存在**两套并行机制**——① npu_patch 的 `patch_cuda_ops()` 在 import pcdet
+  前 sys.modules 预注入 stub（约 300 行：iou3d_nms_utils / roiaware / ingroup_inds / bev_pool /
+  roipoint / hungarian + pointnet2 三模块）；② pcdet 源码自带的 try/except native fallback
+  （`POINTNET2_*_CUDA_ENABLED=False` → `from . import xxx_native`）。机制①是 pcdet 源码无降级
+  时代的产物，pcdet 打上降级补丁后即冗余。
+- **实验证据**：临时短路全部注入后 demo 逐位一致（33 框、数值全同）。
+- **改动**：删 npu_patch 注入链（函数 + 模块级调用）与 `ops_native/` 4 个文件
+  （`pointnet2.py`、`pointnet2_batch_native.py`、`pointnet2_utils_native.py`、
+  `roiaware_pool3d_torch_native.py`——后三个与 pcdet/ops 下副本逐字节相同）；
+  `ops_native/` 仅保留 `iou3d_nms_torch_native.py`（demo/test 后处理直接 import，与 pcdet
+  副本内容不同，非重复）。保留 `patch_rotate_iou`（om_ref_test 官方评测用）与 spconv shim /
+  AscendC 体素化路由 / mask / collate 等活跃补丁。
+- **验证**：收敛后 demo（000008.bin）33 框与基线逐位一致；残留引用 grep 干净。
+  注意：`om_ref_test_pt`（PT 基线）本机无 KITTI 数据未实跑，其 import 链与 demo 同路（均走
+  pcdet try/except fallback），RC 上首次跑 PT 基线时留意。
+
 ### ✅ 删除 static9000 历史三件套（2026-09-29）
 
 - **删除** `convert_fp16_static9000.sh` + `mix_fp16_static9000.json` / `mix_fp16_static9000_v2.json`：
