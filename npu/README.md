@@ -71,7 +71,7 @@ PointPillars 是将 PointNet 直接作用于 pillar（柱体）稀疏体素的 3
   | unum_ops | bevpool-kernel-opt 分支 | **bevpool-kernel-opt**（`a8a101d`） | 必需依赖：spconv shim + **AscendC 体素化 kernel**（含 561000 修复、MAX_NBLK 8）；`pip install -e .` 时自动构建安装 OPP |
   | numpy | ≥1.26 | 2.4.6 | 全链路实测通过 |
   | numba | ≥0.59 | 0.67.0 | mask / FOV / NMS 使用 |
-  | onnx | ≥1.16 | 1.16.1 | 仅模型转换（`export_onnx.py` / `surgery_heads.py`）需要 |
+  | onnx | ≥1.16 | 1.16.1 | 仅模型转换（`export_onnx.py`）需要 |
 
 > 体素化**固定走 AscendC NPU kernel**（无回退无开关）——unum_ops/OPP 缺失或版本过旧会在 `import npu_patch` 时直接 ImportError，运行期算子异常带栈抛出，**不会静默换 CPU numba**；启动时打印一行当前 voxelize 模式。
 
@@ -139,8 +139,7 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
        ├── om_ref_demo.py              # 单帧推理 + 计时（主入口）
        ├── om_ref_test.py              # 全量数据集评测（内嵌官方 KITTI AP）
        ├── om_ref_test_pt.py           # 全量推理（PyTorch 后端，精度对照用）
-       ├── export_onnx.py              # ONNX 导出（--fold-bn / --topk-only）
-       ├── surgery_heads.py            # head 图手术 A/B/C（推荐 OM 生成的一步）
+       ├── export_onnx.py              # ONNX 导出与图手术一条链（--fold-bn / --topk-only / --surgery ABC）
        ├── npu_patch.py                # 设备检测/算子适配统一补丁（体素化固定 AscendC）
        ├── verify_npu.sh               # 环境→补丁→推理→评测 串联验证
        ├── ops_native/                 # 纯 numpy/numba 算子（mask、FOV、iou3d NMS）
@@ -175,19 +174,15 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
 ```bash
 mkdir -p weights
 
-# (a) base ONNX（noscatter+noargmax，纯 CPU 可执行）
+# (a) ckpt → base ONNX → BN 折叠 → 图内 TopK → head 图手术 ABC，一条命令
+#     （--fold-bn：BN 折叠进卷积；--topk-only：图内 ReduceMax+TopK 4096，后处理 11.8→4ms；
+#      --surgery ABC：数学恒等 head 手术——1x1 head 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS，
+#      不做 D，TopK 保持 4096，输出语义与 topk OM 完全一致）
 python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
-    --output weights/pp_base.onnx --base-output weights/pp_base.onnx --fold-bn
+    --base-output weights/pp_base.onnx --output weights/pp_surgery_abc.onnx \
+    --fold-bn --topk-only --surgery ABC
 
-# (b) topk ONNX（图内 ReduceMax+TopK 4096，后处理 11.8→4ms）
-python npu/export_onnx.py --topk-only --skip-export --base-output weights/pp_base.onnx \
-    --output weights/pp_topk.onnx --fold-bn
-
-# (c) head 图手术 ABC（数学恒等变换：1x1 head 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS；
-#     不做 D，TopK 保持 4096，输出语义与 topk OM 完全一致）
-python npu/surgery_heads.py --in weights/pp_topk.onnx --out weights/pp_surgery_abc.onnx --do ABC
-
-# (d) ATC 转 OM（需装有 CANN 的机器；--output 名即推理脚本的默认 OM 名）
+# (b) ATC 转 OM（需装有 CANN 的机器；--output 名即推理脚本的默认 OM 名）
 atc --model=weights/pp_surgery_abc.onnx --framework=5 --soc_version=Ascend310P3 \
     --output=weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc \
     --input_format=ND --precision_mode=force_fp16 \

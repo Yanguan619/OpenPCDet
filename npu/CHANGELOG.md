@@ -8,6 +8,20 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ surgery_heads.py 并入 export_onnx.py：转换链收敛为一条命令（2026-09-29）
+
+- **动机**：ONNX 图手术（A/B/C）本质是 topk-only 图的后处理，与 `export_onnx.py` 既有的
+  `--fold-bn` / `--topk-only` 同属一条生成链，拆两个脚本增加使用成本。
+- **改动**：`export_onnx.py` 新增 `--surgery ABC`（Step 3，原地叠加在 topk-only 输出上），
+  A=1x1 head 合并、B=冗余 gather 消除、C=ConvTranspose→Conv1x1+DepthToSpace；
+  D 保留但打弃用警告（TopK 1024 截断风险）；`--surgery` 不与 `--topk-only` 同用直接报错。
+  删除独立脚本 `npu/surgery_heads.py`；`verify_npu.sh` 语法检查列表换成 `export_onnx.py`；
+  README 转换链 (a)(b)(c) 合并为一条命令。生成链：`--fold-bn --topk-only --surgery ABC`。
+- **验证**：① 手术函数搬移后对同一 topk ONNX 应用 ABC，产物与旧脚本**逐字节一致**
+  （md5 `d8c186bb…`）；② 从现有 topk ONNX 反剥 base 后走新 CLI 全链
+  （`--skip-export --topk-only --surgery ABC`），产物同样**逐字节一致**；③ 参数校验
+  （无 `--topk-only` 报错、D 告警）通过。
+
 ### ✅ 清理 npu/debug/ + README 单一路径化（2026-09-29）
 
 - **删除 `npu/debug/`**（20 个历史/辅助脚本：infer/eval/quick_eval/atc 封装、compare_*/perf_*/

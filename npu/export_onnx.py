@@ -1,11 +1,15 @@
-"""导出 PointPillars ONNX，含后处理（sigmoid → topk → NMS → Gather），
-ATC 后可直接输出最终检测框，无需 Python 后处理。
+"""导出 PointPillars ONNX：ckpt → base → (fold-bn) → topk-only → head 图手术，
+一条命令产出推荐 OM 的直接输入 ONNX。
 
 用法:
-    python npu/export_onnx.py                          # 完整流程: 导出 base → 图手术
-    python npu/export_onnx.py --output weights/pp_nms.onnx
-    python npu/export_onnx.py --score-thresh 0.1 --iou-thresh 0.01 --max-det 500
+    python npu/export_onnx.py                          # base → NMS 后处理图（历史路径）
     python npu/export_onnx.py --skip-export            # 复用已有 base ONNX，只做图手术
+    python npu/export_onnx.py --score-thresh 0.1 --iou-thresh 0.01 --max-det 500
+
+    # 推荐链（生成 surgery ABC ONNX，ATC 后即 demo/test 的默认 OM）：
+    python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth --sample-idx 000008 \
+        --base-output weights/pp_base.onnx --output weights/pp_surgery_abc.onnx \
+        --fold-bn --topk-only --surgery ABC
 """
 
 import argparse
@@ -16,7 +20,7 @@ import numpy as np
 import onnx
 import torch
 import torch.nn as nn
-from onnx import helper, TensorProto, mapping
+from onnx import helper, numpy_helper, TensorProto, mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -479,6 +483,10 @@ def main():
                         help="只做 sigmoid-等价的 ReduceMax + TopK + Gather（不叠加 NMS），"
                              "输出 top-K box/cls，后处理（NMS）留 Python（P2 方案，D2H 13MB->~160KB）")
     parser.add_argument("--topk-k", type=int, default=4096, help="topk-only 的 K（须 <=50000）")
+    parser.add_argument("--surgery", default="",
+                        help="topk-only 之上叠加 head 图手术（推荐 ABC；需与 --topk-only 同用）。"
+                             "A=合并 1x1 head conv，B=消除冗余 gather，C=ConvTranspose→Conv1x1+DepthToSpace；"
+                             "D 已弃用（TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧截断风险）")
     parser.add_argument("--fold-bn", action="store_true", help="把 BatchNormalization 折叠进 Conv/ConvTranspose（数学精确，提速前向）")
     parser.add_argument("--score-thresh", type=float, default=0.1)
     parser.add_argument("--iou-thresh", type=float, default=0.01)
@@ -504,8 +512,21 @@ def main():
         print("===== Step 2: 图手术 - 追加后处理 =====", flush=True)
         add_postproc(base_path, final_path, args)
 
+    if getattr(args, "surgery", ""):
+        if not getattr(args, "topk_only", False):
+            raise SystemExit("--surgery 仅支持 --topk-only 图（推荐链：--fold-bn --topk-only --surgery ABC）")
+        print("===== Step 3: head 图手术 %s =====" % args.surgery.upper(), flush=True)
+        apply_head_surgery(final_path, args.surgery)
+
     print("\n完成! 后续 ATC 转换:", flush=True)
-    print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 --output=weights/pointpillar_nms --input_format=ND" % final_path, flush=True)
+    if getattr(args, "surgery", "") and getattr(args, "topk_only", False):
+        print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 \\" % final_path, flush=True)
+        print("      --output=weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc \\", flush=True)
+        print("      --input_format=ND --precision_mode=force_fp16 \\", flush=True)
+        print("      --input_shape=\"voxels:1~18000,32,4;voxel_num_points:1~18000;"
+              "voxel_coords:1~18000,4;bev_index_map:214272\"", flush=True)
+    else:
+        print("  atc --model=%s --framework=5 --soc_version=Ascend310P3 --output=weights/pointpillar_nms --input_format=ND" % final_path, flush=True)
 
 
 def fold_bn_into_conv(onnx_path):
@@ -655,6 +676,158 @@ def add_topk_only(base_onnx_path, final_onnx_path, args):
     _onnx.checker.check_model(model)
     _onnx.save(model, final_onnx_path)
     print("topk-only ONNX -> %s  (K=%d)" % (final_onnx_path, k), flush=True)
+
+
+# ============================================================
+# Step 3: Head surgery — A/B/C/D 图手术（叠加在 topk-only 之上）
+# ============================================================
+# 每项均为数学恒等变换，节点名依赖 torch.onnx.export 的确定性命名：
+# A. merge_head_convs: 三个 1x1 head conv（/Conv_16=18ch, /Conv_17=42ch, /Conv_18=12ch）
+#    共用同一 384ch 输入，合并为一个 384→72 卷积 + 3 个 Slice（数学恒等，省 2 次重复读）。
+# B. bypass_class_gather: /Gather_5 与 /Gather_6 都是 axis=2 从 /Concat_6 取 index 6
+#    （Concat_6 第 7 个输入就是 /Add_5_output_0），等价于 Squeeze(/Add_5_output_0)。
+#    省掉两个 321408 长度 gather（gatherv2_110 单 kernel 915us）。
+# C. convtranspose2_pixelshuffle: 仅把 4x4/s4 的 /ConvTranspose_2 重写为
+#    Conv1x1(256→2048) + DepthToSpace(blocksize=4)。注意 CANN 的 mode 语义与规范相反，
+#    必须用 mode='CRD' 才是规范 DCR（已用 310P 探针 OM 实测）。
+# D. topk_k_1024: TopK 的 K 常量 4096→1024。已弃用：1024 < NMS_PRE_MAXSIZE 4096，
+#    密集帧 pre-NMS 候选有图内静默截断风险，推荐链保持 TopK 4096。
+
+def merge_head_convs(model):
+    """A: 合并 /Conv_16/17/18 → 单 Conv 384→72 + Slice 回三份。"""
+    g = model.graph
+    init_map = {i.name: i for i in g.initializer}
+    node_by_name = {n.name: n for n in g.node}
+    convs = [node_by_name[nm] for nm in ('/Conv_16', '/Conv_17', '/Conv_18')]
+    ins = [n.input[1] for n in convs]
+    biases = [n.input[2] for n in convs]
+    Ws = [numpy_helper.to_array(init_map[i]) for i in ins]     # (18,384,1,1) (42,384,1,1) (12,384,1,1)
+    bs = [numpy_helper.to_array(init_map[b]) for b in biases]
+    assert all(w.shape[1] == 384 for w in Ws)
+    Wcat = np.concatenate(Ws, axis=0).astype(np.float32)       # (72,384,1,1)
+    bcat = np.concatenate(bs, axis=0).astype(np.float32)       # (72,)
+    w_name, b_name = '/MergedHead_w', '/MergedHead_b'
+    g.initializer.append(numpy_helper.from_array(Wcat, w_name))
+    g.initializer.append(numpy_helper.from_array(bcat, b_name))
+
+    out = '/MergedHead_out'
+    conv = helper.make_node('Conv', ['/Concat_5_output_0', w_name, b_name], [out],
+                            name='/MergedHead', kernel_shape=[1, 1], strides=[1, 1], pads=[0, 0, 0, 0])
+    # 插到 /Concat_5 之后（/Concat_5 是它的输入生产者），保证拓扑序
+    concat_idx = list(g.node).index(node_by_name['/Concat_5'])
+    g.node.insert(concat_idx + 1, conv)
+    insert_at = concat_idx + 2
+
+    # 三个原始 conv 的输出名，改成从合并输出 Slice
+    starts, ends = (0, 18, 60), (18, 60, 72)
+    for i, (start, end, orig) in enumerate(zip(starts, ends, ('/Conv_16_output_0', '/Conv_17_output_0', '/Conv_18_output_0'))):
+        s_name = '/MergedSlice%d_start' % i
+        e_name = '/MergedSlice%d_end' % i
+        a_name = '/MergedSlice%d_axes' % i
+        g.initializer.append(numpy_helper.from_array(np.array([start], dtype=np.int64), s_name))
+        g.initializer.append(numpy_helper.from_array(np.array([end], dtype=np.int64), e_name))
+        g.initializer.append(numpy_helper.from_array(np.array([1], dtype=np.int64), a_name))  # 通道维
+        sl = helper.make_node('Slice', [out, s_name, e_name, a_name], [orig],
+                              name='/MergedSlice%d' % i)
+        g.node.insert(insert_at, sl)
+        insert_at += 1
+
+    # 删除原始三个 conv
+    remove = {c.name for c in convs}
+    nodes = [n for n in g.node if n.name not in remove]
+    del g.node[:]
+    g.node.extend(nodes)
+    print('A: merged /Conv_16/17/18 -> 384x72 conv + slices', flush=True)
+    return model
+
+
+def bypass_class_gather(model):
+    """B: /Gather_5、/Gather_6（axis=2, index=6 on /Concat_6）→ Squeeze(/Add_5_output_0)。"""
+    g = model.graph
+    node_by_name = {n.name: n for n in g.node}
+
+    for nm in ('/Gather_5', '/Gather_6'):
+        n = node_by_name[nm]
+        if n.op_type != 'Gather':
+            print('skip B: %s op=%s' % (nm, n.op_type), flush=True)
+            continue
+        idx = [i for i in n.input if i.endswith('Constant_18_output_0')]
+        axis = [a.i for a in n.attribute if a.name == 'axis']
+        if not idx or not axis or axis[0] != 2:
+            print('skip B: %s unexpected attrs' % nm, flush=True)
+            continue
+        # 替换为 Squeeze，保持输出名不变；插到 /Add_5 之后满足拓扑序
+        # Squeeze 的 axes 以 input（tensor）形式传入，兼容旧 opset
+        axes_name = nm[1:].replace('/', '_') + '_squeeze_axes'
+        g.initializer.append(numpy_helper.from_array(np.array([2], dtype=np.int64), axes_name))
+        sq = helper.make_node('Squeeze', ['/Add_5_output_0', axes_name], [n.output[0]],
+                              name=nm + '_squeeze')
+        g.node.remove(n)
+        add_idx = list(g.node).index(node_by_name['/Add_5'])
+        g.node.insert(add_idx + 1, sq)
+        print('B: %s -> Squeeze(/Add_5_output_0) axes=[2]' % nm, flush=True)
+    return model
+
+
+def convtranspose2_pixelshuffle(model):
+    """C: 仅重写 /ConvTranspose_2 (4x4/s4)。"""
+    g = model.graph
+    init_map = {i.name: i for i in g.initializer}
+    n = next(nn for nn in g.node if nn.name == '/ConvTranspose_2')
+    strides = [list(a.ints) for a in n.attribute if a.name == 'strides'][0]
+    pads = [list(a.ints) for a in n.attribute if a.name == 'pads'][0]
+    if any(pads):
+        raise RuntimeError('ConvTranspose_2 has pads!')
+    s = strides[0]
+    W = numpy_helper.to_array(init_map[n.input[1]])           # (256,128,4,4) = [C_in, C_out, s, s]
+    c_in, c_out = W.shape[0], W.shape[1]
+    W2 = np.transpose(W, (1, 2, 3, 0)).reshape(c_out * s * s, c_in)[:, :, None, None].astype(np.float32)
+    w2_name = n.name + '_ps_w'
+    g.initializer.append(numpy_helper.from_array(W2, w2_name))
+    conv_out = n.output[0] + '_ps_conv'
+    conv = helper.make_node('Conv', [n.input[0], w2_name], [conv_out],
+                            name=n.name + '_ps_conv', kernel_shape=[1, 1], strides=[1, 1], pads=[0, 0, 0, 0])
+    dts = helper.make_node('DepthToSpace', [conv_out], [n.output[0]],
+                           name=n.name + '_ps_dts', blocksize=s, mode='CRD')
+    idx = list(g.node).index(n)
+    del g.node[idx]
+    g.node.insert(idx, dts)
+    g.node.insert(idx, conv)
+    print('C: /ConvTranspose_2 -> Conv1x1(256->2048) + DepthToSpace(CRD, b=4)', flush=True)
+    return model
+
+
+def topk_k_1024(model):
+    """D（已弃用）: TopK K 常量 4096→1024。仅保留供对比，推荐链勿用。"""
+    g = model.graph
+    for i in g.initializer:
+        if i.name == 'topk_k':
+            arr = numpy_helper.to_array(i)
+            arr[:] = 1024
+            i.CopyFrom(numpy_helper.from_array(arr, i.name))
+            print('D: topk_k -> 1024（已弃用：密集帧 pre-NMS 截断风险）', flush=True)
+            return model
+    raise RuntimeError('topk_k initializer not found')
+
+
+_SURGERY_FN = {"A": merge_head_convs, "B": bypass_class_gather,
+               "C": convtranspose2_pixelshuffle, "D": topk_k_1024}
+
+
+def apply_head_surgery(onnx_path, parts="ABC"):
+    """在 topk-only ONNX 上叠加 head 图手术（数学恒等变换），原地更新。"""
+    parts = parts.upper()
+    unknown = [p for p in parts if p not in _SURGERY_FN]
+    if unknown:
+        raise SystemExit("--surgery 未知项: %s（可用 A/B/C/D）" % unknown)
+    if "D" in parts:
+        print("警告: surgery D 已弃用（TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧截断风险），推荐仅用 ABC", flush=True)
+    model = onnx.load(onnx_path)
+    for p in parts:
+        _SURGERY_FN[p](model)
+    onnx.checker.check_model(model)
+    onnx.save(model, onnx_path)
+    print("surgery %s ONNX -> %s（原地更新）" % (parts, onnx_path), flush=True)
 
 
 if __name__ == "__main__":

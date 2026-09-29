@@ -32,7 +32,7 @@ PY
 
 echo
 echo "=== 2. 核心文件存在性 / 语法检查 ==="
-for f in npu/npu_patch.py npu/om_ref_demo.py npu/om_ref_test.py npu/surgery_heads.py; do
+for f in npu/npu_patch.py npu/om_ref_demo.py npu/om_ref_test.py npu/export_onnx.py; do
     if [ ! -f "$f" ]; then
         echo "FAIL: $f 缺失"; exit 1
     fi
