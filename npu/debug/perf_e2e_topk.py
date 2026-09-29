@@ -21,7 +21,8 @@ from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
 from npu.om_ref_demo import (DemoDataset, to_tensor, build_index_map, pad_to_static_m,
-                             tensor_to_numpy, nms_topk_numpy)
+                             tensor_to_numpy, nms_topk_numpy, collate_batch_fast,
+                             postprocess_topk)
 
 OM = ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om'
 BIN = ROOT / '000008.bin'
@@ -74,27 +75,31 @@ def main():
         dd = timed('2.prepare_data(mask+体素化)',
                    lambda: demo_dataset.prepare_data(data_dict={
                        'points': points.copy(), 'frame_id': 0, 'use_lead_xyz': True}), rec)
-        data_dict = timed('3.collate_batch', lambda: demo_dataset.collate_batch([dd]), rec)
+        data_dict = timed('3.collate_batch', lambda: collate_batch_fast([dd]), rec)
 
         def voxelize_tensors():
-            voxels = to_tensor(data_dict['voxels'])
-            vnp = to_tensor(data_dict['voxel_num_points'])
-            vco = to_tensor(data_dict['voxel_coords'].astype(np.int32))
+            # 纯 numpy：data_dict 里的数组本就是 numpy，跳过 to_tensor / astype 往返
+            voxels = data_dict['voxels']          # (M, 32, 4) float32
+            vnp = data_dict['voxel_num_points']   # (M,) int32
+            vco = data_dict['voxel_coords']       # (M, 4) int32（含 batch 列）
             if is_dynamic:
-                bim = build_index_map(vco, M=voxels.shape[0])
+                bim = build_index_map(vco, M=voxels.shape[0]).numpy()
             else:
                 if voxels.shape[0] > expect_m:
                     raise RuntimeError('M=%d 超过静态 OM M=%d' % (voxels.shape[0], expect_m))
-                voxels, vnp, vco, bim = pad_to_static_m(voxels, vnp, vco, expect_m)
+                voxels, vnp, vco, bim = pad_to_static_m(
+                    to_tensor(voxels), to_tensor(vnp), to_tensor(vco), expect_m)
+                voxels, vnp, vco = voxels.numpy(), vnp.numpy(), vco.numpy()
+                bim = bim.numpy()
             return voxels, vnp, vco, bim
         voxels, vnp, vco, bim = timed('4.tensor+index_map/pad', voxelize_tensors, rec)
         M = voxels.shape[0]
 
         def mkfeeds():
-            fs = [aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(vnp.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(vco.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(bim.numpy()))]
+            fs = [aclruntime.Tensor(np.ascontiguousarray(voxels)),
+                  aclruntime.Tensor(np.ascontiguousarray(vnp)),
+                  aclruntime.Tensor(np.ascontiguousarray(vco)),
+                  aclruntime.Tensor(np.ascontiguousarray(bim))]
             for t in fs:
                 t.to_device(DEVICE)
             return fs
@@ -122,13 +127,8 @@ def main():
         om_box, om_cls = timed('8.输出D2H', d2h, rec)
 
         def post():
-            b = om_box.reshape(1, -1, 7)
-            c = om_cls.reshape(1, -1, 3)
-            cls_max, label = torch.max(torch.from_numpy(c[0]), dim=-1)
-            label = label + 1
-            scores = torch.sigmoid(cls_max)
-            selected, s2 = nms_topk_numpy(b[0], scores, score_thresh, nms_config)
-            return b[0][selected], label[selected].numpy(), s2
+            # numpy max/argmax + torch sigmoid + numpy 增量 NMS（与 torch 版逐位一致）
+            return postprocess_topk(om_box, om_cls, score_thresh, nms_config)
         boxes, labels, scores = timed('9.后处理(max+sigmoid+NMS)', post, rec)
 
         e2e_times.append((time.perf_counter() - frame_t0) * 1000)

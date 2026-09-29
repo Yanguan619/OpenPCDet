@@ -33,11 +33,20 @@ if _HAS_NUMBA:
         a_cos = np.cos(r[6])
         a_sin = np.sin(r[6])
         cx, cy, xd, yd = r[0], r[1], r[3], r[4]
-        lx = np.array([-xd / 2, -xd / 2, xd / 2, xd / 2])
-        ly = np.array([-yd / 2, yd / 2, yd / 2, -yd / 2])
-        for i in range(4):
-            c[i, 0] = a_cos * lx[i] + a_sin * ly[i] + cx
-            c[i, 1] = -a_sin * lx[i] + a_cos * ly[i] + cy
+        # 与数组版（lx=[-xd/2,-xd/2,xd/2,xd/2], ly=[-yd/2,yd/2,yd/2,-yd/2]）同算术：
+        # (-xd)/2 == -(xd/2)（除以 2 精确），逐元素乘加顺序完全一致 → 输出逐位一致
+        hxd = xd / 2
+        hyd = yd / 2
+        lx0 = -hxd; lx1 = -hxd; lx2 = hxd; lx3 = hxd
+        ly0 = -hyd; ly1 = hyd; ly2 = hyd; ly3 = -hyd
+        c[0, 0] = a_cos * lx0 + a_sin * ly0 + cx
+        c[0, 1] = -a_sin * lx0 + a_cos * ly0 + cy
+        c[1, 0] = a_cos * lx1 + a_sin * ly1 + cx
+        c[1, 1] = -a_sin * lx1 + a_cos * ly1 + cy
+        c[2, 0] = a_cos * lx2 + a_sin * ly2 + cx
+        c[2, 1] = -a_sin * lx2 + a_cos * ly2 + cy
+        c[3, 0] = a_cos * lx3 + a_sin * ly3 + cx
+        c[3, 1] = -a_sin * lx3 + a_cos * ly3 + cy
 
     @numba.jit(nopython=True)
     def _nms_inter(c1, c2):
@@ -138,10 +147,27 @@ if _HAS_NUMBA:
         for i in range(N):
             _nms_corners(boxes[i], corn)
             a1 = boxes[i, 3] * boxes[i, 4]
+            # AABB min/max 提拉出内层循环（原版每 k 迭代重算 corn[:,*].min/max 4 次；
+            # 4 个值的最小/最大与数组归约逐位一致）
+            cmin0 = corn[0, 0]
+            cmax0 = corn[0, 0]
+            cmin1 = corn[0, 1]
+            cmax1 = corn[0, 1]
+            for t in range(1, 4):
+                v = corn[t, 0]
+                if v < cmin0:
+                    cmin0 = v
+                if v > cmax0:
+                    cmax0 = v
+                v = corn[t, 1]
+                if v < cmin1:
+                    cmin1 = v
+                if v > cmax1:
+                    cmax1 = v
             keep = True
             for k in range(n_kept):
-                if (corn[:, 0].min() > kamax[k, 0] or corn[:, 0].max() < kamin[k, 0]
-                        or corn[:, 1].min() > kamax[k, 1] or corn[:, 1].max() < kamin[k, 1]):
+                if (cmin0 > kamax[k, 0] or cmax0 < kamin[k, 0]
+                        or cmin1 > kamax[k, 1] or cmax1 < kamin[k, 1]):
                     continue
                 ai = _nms_inter(corn, kcorn[k])
                 if ai <= 0:
@@ -151,10 +177,10 @@ if _HAS_NUMBA:
                     break
             if keep:
                 kcorn[n_kept] = corn
-                kamin[n_kept, 0] = corn[:, 0].min()
-                kamax[n_kept, 0] = corn[:, 0].max()
-                kamin[n_kept, 1] = corn[:, 1].min()
-                kamax[n_kept, 1] = corn[:, 1].max()
+                kamin[n_kept, 0] = cmin0
+                kamax[n_kept, 0] = cmax0
+                kamin[n_kept, 1] = cmin1
+                kamax[n_kept, 1] = cmax1
                 karea[n_kept] = a1
                 kept[n_kept] = i
                 n_kept += 1

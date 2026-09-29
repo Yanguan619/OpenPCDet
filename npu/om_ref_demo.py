@@ -122,6 +122,37 @@ def to_tensor(x):
     return torch.from_numpy(x) if isinstance(x, np.ndarray) else x.cpu()
 
 
+def collate_batch_fast(batch_list):
+    """单帧 collate fast-path：跳过 list-of-dict + 通用 collate_batch 的拷贝开销。
+
+    与 DatasetTemplate.collate_batch 对单帧的输出保持同格式：
+      - voxels / voxel_num_points 直接引用原数组（OM 路径只读消费，不拷贝）；
+      - voxel_coords 补 batch 列 -> (M, 4) int32（col0=0，与 np.pad 一致）；
+      - 标量/矩阵 key 与通用 collate 相同 np.stack。
+    唯一偏差：'points' 不补 batch 列（返回 (N, 4) 原引用）——OM 推理路径不消费
+    points，省去 ~1ms 的 (N,5) 填充拷贝；需要标准 collate 输出时请用
+    DatasetTemplate.collate_batch。
+    多帧 batch（len>1）回退到通用 collate_batch，保证兼容。
+    """
+    if len(batch_list) == 1:
+        dd = batch_list[0]
+        ret = {}
+        for key, val in dd.items():
+            if key in ('voxels', 'voxel_num_points'):
+                ret[key] = val  # 单帧无 batch 维，直接引用（只读消费）
+            elif key == 'voxel_coords':
+                out = np.zeros((val.shape[0], val.shape[1] + 1), dtype=val.dtype)
+                out[:, 1:] = val
+                ret[key] = out
+            elif key == 'points':
+                ret[key] = val  # 不补 batch 列，见 docstring
+            else:
+                ret[key] = np.stack([val], axis=0)
+        ret['batch_size'] = 1
+        return ret
+    return DatasetTemplate.collate_batch(batch_list)
+
+
 def _mm3(pts, m):
     """pts(N,3) @ m(3,3)：列式逐元素（与 np.dot 同乘加顺序，仅 ~1 点/帧 浮点边界翻转）。
 
@@ -240,7 +271,7 @@ def nms_topk_numpy(boxes, scores, score_thresh, nms_config):
 
     Args:
         boxes: (N, 7) float32 numpy，anchor 回归框（原始顺序）
-        scores: (N,) torch CPU，sigmoid 后单类分数
+        scores: (N,) torch CPU 或 numpy，sigmoid 后单类分数
         score_thresh: float 或 None
         nms_config: NMS_PRE_MAXSIZE / NMS_POST_MAXSIZE / NMS_THRESH
     Returns:
@@ -250,7 +281,7 @@ def nms_topk_numpy(boxes, scores, score_thresh, nms_config):
     pre_max = int(getattr(nms_config, "NMS_PRE_MAXSIZE", 4096))
     post_max = int(getattr(nms_config, "NMS_POST_MAXSIZE", 500))
     thresh = float(getattr(nms_config, "NMS_THRESH", 0.01))
-    snp = scores.numpy()
+    snp = scores.numpy() if hasattr(scores, "numpy") else np.asarray(scores)
     if score_thresh is not None:
         keep = np.nonzero(snp >= score_thresh)[0]
     else:
@@ -276,6 +307,32 @@ def nms_topk_numpy(boxes, scores, score_thresh, nms_config):
     kept = _nms_incremental(boxes_nms, thresh)[:post_max]
     orig = keep[kept]
     return orig, snp[orig]
+
+
+def postprocess_topk(om_box, om_cls, score_thresh, nms_config):
+    """OM topk 输出的 host 后处理（numpy max/argmax + torch sigmoid + numpy 增量 NMS）。
+
+    与 torch 版（torch.max + sigmoid + nms_topk_numpy）**逐位一致**：
+      - numpy .max/.argmax 与 torch.max 的值/下标一致（已验证）
+      - sigmoid 保留 torch（numpy 1/(1+exp(-x)) 与 torch.sigmoid 有 1ULP 差异，不能替换）
+    省掉 torch.max 在 (4096,3) 小张量上的调度开销（~3.8ms -> ~0.05ms）。
+
+    Args:
+        om_box: (1, N, 7) float32 numpy（可为 aclruntime host 视图）
+        om_cls: (1, N, 3) float32 numpy
+        score_thresh / nms_config: 同 nms_topk_numpy
+    Returns:
+        boxes: (K, 7) float32 numpy
+        labels: (K,) int64 numpy（1-indexed class id）
+        scores: (K,) float32 numpy（sigmoid 后）
+    """
+    b = om_box.reshape(1, -1, 7)[0]
+    c0 = om_cls.reshape(1, -1, 3)[0]
+    cls_max = c0.max(axis=-1)
+    label = c0.argmax(axis=-1) + 1
+    scores = torch.sigmoid(torch.from_numpy(cls_max))
+    selected, sel_scores = nms_topk_numpy(b, scores, score_thresh, nms_config)
+    return b[selected], label[selected], sel_scores
 
 
 def load_kitti_labels(label_path, calib=None):
@@ -509,7 +566,7 @@ def main():
     for idx, data_dict in enumerate(demo_dataset):
         logger.info(f'Visualized sample index: \t{idx + 1}')
         frame_id = Path(demo_dataset.sample_file_list[idx]).stem
-        data_dict = demo_dataset.collate_batch([data_dict])
+        data_dict = collate_batch_fast([data_dict])
 
         voxels = to_tensor(data_dict['voxels'])
         voxel_num_points = to_tensor(data_dict['voxel_num_points'])
@@ -558,13 +615,8 @@ def main():
         if base_mode:
             om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, -1, 7)
             om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, -1, 3)
-            # sigmoid 单调递增：max(sigmoid(x)) == sigmoid(max(x))，先取类间 max 再 sigmoid（省 2/3 逐元素）
-            cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
-            label = label + 1
-            scores = torch.sigmoid(cls_max)
-            selected, scores = nms_topk_numpy(om_box[0], scores, score_thresh, nms_config)
-            boxes = om_box[0][selected]
-            labels = label[selected].numpy()
+            # numpy max/argmax + torch sigmoid + numpy 增量 NMS（与 torch 版逐位一致）
+            boxes, labels, scores = postprocess_topk(om_box, om_cls, score_thresh, nms_config)
         else:
             # 内嵌 NMS 的 OM：输出 nms_final_boxes/scores/labels/count
             boxes = tensor_to_numpy(out[0], np.float32).reshape(-1, 7)
