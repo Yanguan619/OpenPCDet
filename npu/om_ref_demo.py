@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 # 设备常驻管线（voxelization 输出保持 NPU tensor 直通 feeds）：默认开启，
 # NPU_VOX_DEVICE_RESIDENT=0 可回退 numpy 路径做 A/B。必须在 import npu_patch 前设置。
 os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
-import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+import npu.npu_patch  # noqa: E402,F401  spconv alias + AscendC 体素化 + numba mask，须在 import pcdet 之前
 
 import aclruntime
 import numpy as np
@@ -731,7 +731,6 @@ def main():
             print('\n(未找到 label 文件，跳过对比。可用 --label 指定)')
 
     logger.info('Demo done.')
-    npu.npu_patch.hard_exit(0)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,45 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ npu 目录清理：死代码 / 过时引用 / hard_exit 兜底移除（2026-09-29）
+
+- **hard_exit 兜底移除**（`npu_patch.hard_exit` 及 `om_ref_demo`/`om_ref_test` 尾部调用）：
+  引入它是为规避 aclruntime↔torch_npu 双运行时 teardown 争抢 reset device 的 segfault/bus error；
+  09-29 在 CANN 9.0.0 实测：自然退出仅打 `[WARN] acl repeat destroy`（良性）、**退出码 0**，
+  兜底失去存在意义，顺带消除 `os._exit` 跳过正常清理的隐患。
+  （注意：**纯 aclruntime 不拉起 torch_npu** 的进程退出仍会 segfault——探针脚本实测；交付脚本均经
+  npu_patch 拉起 torch_npu 设备上下文，teardown 走 repeat-warn 路径，不受影响。）
+- **死代码删除**：`npu_patch.PPWrapper`——无任何调用方（`om_ref_test_pt` 用的是
+  `export_onnx.PPWrapper`，两份功能重复），连带修正模块 docstring 对早已删除的
+  `npu/infer.py`/`npu/eval.py` 的引用；`om_ref_test` 对不存在的 `npu/debug.npu_patch`
+  的 import 回退。
+- **过时注释修正**：4 个脚本的 `import npu.npu_patch` 行仍写"预注入 CUDA ops 降级 stub"
+  （该注入链已于 50c60ef 删除），改为如实描述当前副作用（spconv alias + AscendC 体素化 +
+  numba mask）；export_onnx 该行补回 `noqa: E402,F401`。
+- **验证**：demo 000008（33 框）退出码 0；`om_ref_test` 与 demo 同构（npu_patch→torch_npu +
+  aclruntime 同一 teardown 路径），本机缺 KITTI infos 未复跑全量；改动文件 `py_compile` 全通过。
+
+### ✅ export_onnx 推荐链默认化：转换命令只需 --ckpt/--output（2026-09-29）
+
+- **动机**：推荐链 `--dynamic --topk-only --surgery ABC` 是唯一验证口径，README 却要显式传
+  4 个开关 + `--base-output`，命令负担无意义。
+- **改动（export_onnx.py）**：
+  - `--dynamic` / `--topk-only` 改 `argparse.BooleanOptionalAction` 并**默认开启**
+    （`--no-dynamic` / `--no-topk-only` 关闭）；`--surgery` 默认 `ABC`（传 `none` 显式关闭；
+    `--no-topk-only` 且未显式指定时自动置空，显式指定仍硬报错，冲突校验前移到解析后，
+    避免先做图手术再失败）。
+  - `--base-output` 默认由 `--output` 派生（`<去后缀>_base.onnx`）；`--output` 默认改为
+    `weights/pointpillar_7728_abc.onnx`（与默认 ckpt 对应；原默认 `pointpillar_nms.onnx`
+    属历史路径产物名）。脚本尾部的 ATC 转换提示整段移除（完整命令以 README 为准）。
+- **文档**：README 模型转换命令简化为 `python npu/export_onnx.py --ckpt ... --output ...`，
+  ATC `--output` 对齐推理脚本默认 OM 名（`..._topk_surgery_abc_linux_aarch64`，此前 ATC 产物名
+  与 demo 引用名不一致，照抄 README 会 FileNotFoundError），demo 命令随之不再显式传 `--om`；
+  PERFORMANCE.md §1 纯 topk 复现命令补 `--surgery none`（避免新默认把 ABC 叠进对比图）。
+- **验证**：本机（310P3）仅传 `--ckpt/--output` 重跑推荐链，最终 ONNX 与 base 中间产物
+  均与显式全参数命令产物**逐字节一致**（cmp）；`--skip-export --surgery none` 出纯 topk
+  图（无 Step 3）、`--skip-export --no-topk-only` 出 NMS 后处理图、
+  `--surgery ABC --no-topk-only` 报参数冲突，均通过。
+
 ### ✅ export_onnx 数据集无关化 + 补全 Ascend 图改写环节（2026-09-29）
 
 - **背景**：转换链此前依赖 KITTI 数据集（`--sample-idx` 走 KittiDataset 取真实样本），且验证中发现

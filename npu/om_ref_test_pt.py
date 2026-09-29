@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+import npu.npu_patch  # noqa: E402,F401  spconv alias + AscendC 体素化 + numba mask，须在 import pcdet 之前
 
 import numpy as np
 import torch

@@ -36,7 +36,7 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 > 基线 369ms/帧（2026-09-22 全量 3769 帧初版动态 OM）→ topk(P2) 64.3ms，累计 **5.7x**。
 > **P2 精度与 base 完全一致**（top-K 按 raw cls 单调等价 sigmoid 排序）：本口径（200 帧）AP
 > Car 77.81 / Ped 59.86 / Cyc 38.32；全量 3769 帧口径见 1.2 与 §6。
-> 导出：`python npu/export_onnx.py --topk-only --skip-export --base-output <base> --output <topk>`
+> 导出：`python npu/export_onnx.py --topk-only --surgery none --skip-export --base-output <base> --output <topk>`
 
 ### 1.1 静态 pad 到最大的 E2E 进一步拆分（全量 3769 帧）
 
@@ -226,8 +226,9 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
   - 正确性口径：voxel 逐帧**排序等价**（sorted-equal：coord 多重集相同、同 coord 特征/npp 相同）但**行序与 numba 不同**；
     200 帧中 199 帧 sorted-equal，frame 38 少 1 个越界边界体素（coord z=432 超出 BEV 网格，不影响输出）。
   - 红线通过：**200 帧 OM AP 与 numba 基线逐位一致**（diff=0）；比较/评测链路不受 voxel 行序影响。
-  - 副作用：AscendC 会把 torch_npu 设备上下文拉进 aclruntime 进程，自然退出时双运行时 teardown 冲突
-    会 segfault/bus error（结果已全部产出）；`om_ref_demo/om_ref_test` 结果输出后调 `npu_patch.hard_exit(0)` 硬退出。
+  - 副作用：AscendC 会把 torch_npu 设备上下文拉进 aclruntime 进程，双运行时 teardown 冲突曾致
+    自然退出 segfault/bus error（结果已全部产出），09-29 前靠 `npu_patch.hard_exit(0)` 硬退出兜底；
+    09-29 起 CANN 9.0.0 实测自然退出仅 `[WARN] acl repeat destroy`（良性）、退出码 0，兜底已移除。
   - kernel 级优化：`MAX_NBLK=7` 曾为单 cube 8 AIV 验证上限；提到 15 实测无提速（21.8 vs 21.3ms）——
     kernel 受 12 次软件栅障（radix 多趟 + 全量 L1 dcci）+ 每调用 aclnn 两段式固定 ~5ms 串行化限制，
     **不是核数限制**。

@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 # 设备常驻管线：voxelization 输出保持 NPU tensor（collate/index_map/feeds 全程 device 侧），
 # 消除 D2H→numpy→H2D 往返。须在 import npu_patch 前设置；=0 可回退 numpy 路径做 A/B。
 os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
-import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
+import npu.npu_patch  # noqa: E402,F401  spconv alias + AscendC 体素化 + numba mask，须在 import pcdet 之前
 
 import aclruntime
 import numpy as np
@@ -98,10 +98,7 @@ def build_det_annos(preds_by_frame, dataset, sample_ids, class_names):
 
 def run_official_eval(preds_by_frame, dataset, sample_ids, class_names):
     """官方 KITTI 评测（R11/R40 AP，与 tools/test.py 的 eval_one_epoch 同口径）。"""
-    try:
-        from npu.npu_patch import patch_rotate_iou
-    except ImportError:
-        from npu.debug.npu_patch import patch_rotate_iou
+    from npu.npu_patch import patch_rotate_iou
     patch_rotate_iou()  # 必须先于 kitti 评测模块 import（CPU rotate_iou 注入）
     from pcdet.datasets.kitti.kitti_object_eval_python import eval as kitti_eval
 
@@ -393,8 +390,6 @@ def main():
     else:
         # 官方 KITTI 评测（与 tools/test.py 的 eval_one_epoch 同口径，R11/R40 AP）
         run_official_eval(preds_by_frame, demo_dataset, sample_ids, CLASS_NAMES)
-
-    npu.npu_patch.hard_exit(0)
 
 
 if __name__ == "__main__":

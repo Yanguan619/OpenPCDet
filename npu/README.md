@@ -175,52 +175,26 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
 
 ## 模型转换（ckpt → ONNX → OM）
 
-`weights/` 与 `data/` 不入 git，OM 需自行生成。**转换不依赖 KITTI 数据集**：模型构建走纯配置 `DatasetTemplate`（只从 yaml 派生 grid_size 等标量，不加载任何数据文件），导出输入为按推理接口规格合成的 dummy 张量（tracer 只消费形状/dtype，数值不入图；该链已与真实数据产物验证等价——图结构同构、NPU demo 33 框逐位一致）。以下命令从权重一步生成推理脚本的**默认 OM**：
-
 ```bash
 mkdir -p weights
 
-# (a) ckpt → ONNX 一条命令，内部依次：
-#     Step 1   导出 base ONNX（合成输入，无数据集依赖；--dynamic 把 M 维标为动态）
-#     Step 1.5 Ascend 图改写（必经，无开关）：ScatterND→Slice+Concat、ArgMax→Greater+Cast
-#              —— 310P 上 ScatterND/ArgMax 均为单核标量实现（单帧 ~125ms/~19ms），
-#              改写后多核向量化且 bit 级一致；依赖 msit onnx_optimizer 两个 knowledge
-#     Step 2   图内 TopK（ReduceMax+TopK 4096，后处理 11.8→4ms）
-#     Step 3   head 图手术 ABC（数学恒等：1x1 head 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS；
-#              不做 D，TopK 保持 4096，输出语义与 topk OM 完全一致）
+# (a) ckpt → ONNX
 python npu/export_onnx.py --ckpt weights/pointpillar_7728.pth \
-    --base-output weights/pp_base.onnx --output weights/pp_surgery_abc.onnx \
-    --dynamic --topk-only --surgery ABC
+    --output weights/pointpillar_7728.onnx
 
-# (b) ATC 转 OM（需装有 CANN 的机器；--output 名即推理脚本的默认 OM 名）
-atc --model=weights/pp_surgery_abc.onnx --framework=5 --soc_version=Ascend310P3 \
-    --output=weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc \
+# (b) ATC 转 OM（--output 名即推理脚本的默认 OM 名，demo/评测无需再传 --om）
+atc --model=weights/pointpillar_7728.onnx --framework=5 --soc_version=Ascend310P3 \
+    --output=weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64 \
     --input_format=ND --precision_mode=force_fp16 \
     --input_shape="voxels:1~18000,32,4;voxel_num_points:1~18000;voxel_coords:1~18000,4;bev_index_map:214272"
 ```
 
-ATC 精度要点：
-
-- **`force_fp16` 已验证 AP 1% 容差内**（200 帧 R11 3D moderate，Car 77.81 / Ped 59.86 / Cyc 38.32）。
-- 动态 shape 用 **range 记法** `voxels:1~18000`，**勿用 `-1`/`--dynamic_dims`**（避免 ATC mbatch 切分报错）。
-- dtype：`voxel_num_points`/`voxel_coords` 为 int32、`bev_index_map` 为 int64，ATC 不可覆盖。
-- `voxel_coords` 经 collate 后是 Fortran 序，喂 OM 前必须 `np.ascontiguousarray`（推理脚本已处理）。
-- 若 `atc` 报 `No module named 'numpy'`（其内部 tbe 组件调用系统 `/usr/bin/python3`，而 numpy 装在当前解释器），前置注入后重试：
-
-  ```bash
-  PYTHONPATH=$(python -c "import site; print(site.getsitepackages()[0])"):$PYTHONPATH \
-      atc --model=weights/pp_surgery_abc.onnx ...   # 其余参数同上
-  ```
-
 ## 模型推理
-
-> **启动目录**：所有命令在仓库根执行（`python npu/xxx.py`）；demo 与评测的 `--om` 缺省即上一步生成的 surgery ABC OM，无需显式指定。
 
 ### 单帧推理 demo
 
 ```bash
-python npu/om_ref_demo.py \
-    --data_path data/kitti/training/velodyne/000008.bin
+python npu/om_ref_demo.py --data_path data/kitti/training/velodyne/000008.bin
 ```
 
 | 参数 | 默认值 | 说明 |

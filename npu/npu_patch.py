@@ -1,13 +1,14 @@
 """NPU 适配补丁：统一管理设备检测、算子适配与可重复调用的初始化入口。
 
-被 npu/infer.py 与 npu/eval.py 复用，集中处理：
+被 npu/om_ref_demo.py、npu/om_ref_test.py、npu/export_onnx.py 等推理/转换脚本复用，
+集中处理：
 1. 设备检测（npu / cuda / cpu）
 2. torch_npu 初始化（关闭 jit_compile 以避免逐帧编译）
 3. anchors / tensor 的跨设备搬运
 4. voxelization 相关适配（build_index_map 等）
 
 用法:
-    from npu.npu_patch import init_patch, patch_rotate_iou, get_device, to_tensor, build_index_map, PPWrapper
+    from npu.npu_patch import init_patch, patch_rotate_iou, get_device, to_tensor, build_index_map
     device = init_patch()
 """
 
@@ -582,47 +583,3 @@ _alias_spconv()
 _patch_voxelize_ascendc()
 _patch_mask_points_by_range()
 _patch_collate_tensor_aware()
-
-
-class PPWrapper(torch.nn.Module):
-    """PointPillar module_list 前向封装：喂入 voxel 输入，输出 (box_preds, cls_preds)。
-
-    等价于原模型 forward，但显式组装 batch_dict 并逐模块执行，
-    便于直接拿到解码后的 batch_box_preds / batch_cls_preds。
-    """
-
-    def __init__(self, model):
-        super().__init__()
-        self.module_list = model.module_list
-
-    def forward(self, voxels, voxel_num_points, voxel_coords, bev_index_map):
-        batch_dict = {
-            "voxels": voxels,
-            "voxel_num_points": voxel_num_points,
-            "voxel_coords": voxel_coords,
-            "bev_index_map": bev_index_map,
-            "batch_size": 1,
-        }
-        for m in self.module_list:
-            batch_dict = m(batch_dict)
-        return batch_dict["batch_box_preds"], batch_dict["batch_cls_preds"]
-
-
-def hard_exit(code=0):
-    """硬退出，跳过 aclruntime↔torch_npu 双运行时的 teardown 冲突。
-
-    AscendC 体素化会在 aclruntime 进程内拉起 torch_npu 设备上下文（.npu() +
-    aclnn 走 torch_npu stream），进程自然退出时两运行时争抢 reset device 会
-    segfault/bus error。结果已全部输出完后再硬退即可（先 flush 全部缓冲）。
-    """
-    import logging
-
-    for handler in logging.root.handlers:
-        try:
-            handler.flush()
-        except Exception:
-            pass
-    logging.shutdown()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(code)
