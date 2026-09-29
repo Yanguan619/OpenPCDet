@@ -192,7 +192,7 @@ python npu/om_ref_test.py --om weights/<你的 om>.om
 - 基线 369ms（2026-09-22 全量）→ 63.3ms，累计 **5.8x**（全量口径）。
 - 当前瓶颈：OM 推理 ~11ms（backbone conv 占 44% + scatter 1.26ms）与体素化 kernel 6.24ms（标量排序墙）；
   **10ms 目标在当前 fp16 OM 路径不可达**，后续需 int8 量化 / 自定义 scatter / kernel 向量化（详见
-  `npu/PERFORMANCE.md` §1.5）。
+  `npu/PERFORMANCE.md` §1.3）。
 
 ## 文档索引
 

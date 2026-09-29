@@ -7,7 +7,7 @@ PointPillars 在 NPU（Ascend 310P3）上的性能数据、瓶颈分析与优化
 
 - **单帧 demo E2E 22.5ms**（无 FOV，体素化 122555 点）：读bin 0.35 + prepare_data 9.62（AscendC 体素化
   + 设备常驻）+ collate 0.13 + index_map 0.32 + feeds 0.41 + set_dym 0.09 + **OM 推理 10.97（head 图手术
-  ABCD）** + D2H 0.12 + 后处理 0.48；检测 33 框（Car 12/Ped 14/Cyc 7）与基线逐帧一致（详见 §1.5）；
+  ABCD）** + D2H 0.12 + 后处理 0.48；检测 33 框（Car 12/Ped 14/Cyc 7）与基线逐帧一致（详见 §1.3）；
 - 单帧口径演进：~93ms（numba 体素化）→ ~67ms（09-28 AscendC est.）→ **22.5ms**（09-29 三线攻坚）；
 - 全量管线口径（有 FOV，200 帧）09-28 值 **63.3ms/帧**，本轮未重测（无数据集环境）；本轮前处理/推理/
   后处理各段均有收益，待数据集环境复测；
@@ -80,15 +80,15 @@ E2E 最优见 1.4；base 版为 `pointpillar_base_fp16_dynamic18000_force_linux_
 > 与 1.1/1.2 不同：demo 路径**不做 FOV 过滤**（与 `tools/demo.py` 一致），直接体素化 122555 原始点。
 > 以下为单帧完整 E2E（含 `__getitem__` 体素化），本机 000008，avg 10。
 
-| 阶段 | base fp16 static18000 | base fp16 dynamic18000 | **topk fp16 dynamic18000** |
-|---|---|---|---|
-| getitem（读 bin + 体素化 122555 点） | ~34 ms（42%） | ~34 ms（44%） | ~32 ms（48%） |
-| collate + to_tensor | 4.6 ms | 4.8 ms | 4.5 ms |
-| pad / index_map | 4.5 ms | 0.7 ms | 0.7 ms |
-| feeds（aclruntime.Tensor） | 4.8 ms | 2.4 ms | 2.4 ms |
-| **forward** | 19.7 ms | 21.5 ms | 22.8 ms |
-| postproc（sigmoid + topk + NMS） | 13.4 ms | 14.3 ms | **4.0 ms** |
-| **单帧完整 E2E** | ~81 ms | ~78 ms | ~67 ms（est.） |
+| 阶段 | base fp16 static18000 | base fp16 dynamic18000 | topk fp16 dynamic18000 | **09-29 三线攻坚集成态** |
+|---|---|---|---|---|
+| getitem（读 bin + 体素化 122555 点） | ~34 ms（42%） | ~34 ms（44%） | ~32 ms（48%） | **10.0 ms（44%）** |
+| collate + to_tensor | 4.6 ms | 4.8 ms | 4.5 ms | **0.13 ms** |
+| pad / index_map | 4.5 ms | 0.7 ms | 0.7 ms | **0.32 ms** |
+| feeds（aclruntime.Tensor） | 4.8 ms | 2.4 ms | 2.4 ms | **0.50 ms**（含 set_dym 0.09） |
+| **forward** | 19.7 ms | 21.5 ms | 22.8 ms | **10.97 ms**（surgery ABCD OM） |
+| postproc（sigmoid + topk + NMS） | 13.4 ms | 14.3 ms | 4.0 ms | **0.60 ms**（含 D2H 0.12） |
+| **单帧完整 E2E** | ~81 ms | ~78 ms | ~67 ms（est.） | **22.5 ms**（30 iters 中位） |
 
 > ⚠️ 上表 getitem/E2E 为 **2026-09-28 体素化切 AscendC 后重算的估计值**（表内其它阶段仍为原 avg10 实测）：
 > 体素化 generate 000008（M=7260）对照实测 **AscendC 21.3ms vs numba 53.4ms（~2.5x）**
@@ -100,12 +100,27 @@ E2E 最优见 1.4；base 版为 `pointpillar_base_fp16_dynamic18000_force_linux_
 >   + forward +1.3（图内多一次 TopK）+ getitem 噪声 ~-2；
 > - **static→dynamic（同 base）**：再省 ~3.7ms = pad -3.8 + feeds -2.4，forward +1.8 反噬；
 > - 两变量叠加即「static base → topk dynamic」共省 ~14.9ms——**勿全记在 topk 头上**。
-> - **三种口径的当前数字**（术语见文首）：
->   - **demo 单帧**（无 FOV）：~67ms（topk，est.）——含体素化（AscendC 2.5x），`getitem` 占 ~48%；
->   - **推理链路**（不含体素化）：~34ms（collate 4.5 + pad 0.7 + feeds 2.4 + forward 22.8 + postproc 4.0）；
->   - **全量管线口径 200 帧**（有 FOV）：63.3ms/帧——FOV 后点数减 ~7 倍（000008：122555→17221），
->     虽多一步 FOV，但体素化省更多 → 反而比 demo 快。
+> - **三种口径的当前数字**（术语见文首；09-29 集成态）：
+>   - **demo 单帧**（无 FOV）：**22.5ms**（09-29 实测，device 1，30 iters 中位）——体素化（AscendC+设备常驻）占 ~44%；
+>   - **推理链路**（不含体素化）：**~12.5ms**（collate 0.13 + index_map 0.32 + feeds 0.50 + forward 10.97 + postproc 0.60）；
+>   - **全量管线口径 200 帧**（有 FOV）：63.3ms/帧（09-28 值，本轮各段优化未在全量口径复测）——FOV 后点数减
+>     ~7 倍（000008：122555→17221），虽多一步 FOV，但体素化省更多 → 反而比 demo 快。
 > - **`OM inference time` 只计 forward 段**，不代表整帧。
+
+**09-29 三线攻坚收益归因**（topk est. ~67 → 实测 22.5；根因与细节见 CHANGELOG 09-29 条目）：
+
+| 优化 | 段 | 前 → 后 | 收益 |
+|---|---|---|---|
+| 体素化 561000 修复（ThreadCtxGuard）+ numba 单遍 mask + MAX_NBLK 7→8 | getitem | ~32 → 10.0 | **−22** |
+| collate 单帧 fast-path（双态）+ to_tensor/index_map 收敛 | collate+index_map | 5.2 → 0.45 | **−4.8** |
+| 设备常驻 feeds（NPU tensor 经 BaseTensor 零拷贝直通） | feeds | 2.4 → 0.50 | **−1.9** |
+| head 图手术 ABCD（恒等变换，同设备对照） | forward | 11.32 → 9.60 | **−1.7** |
+| numpy max/argmax + numba NMS 标量化 + D2H copy=False | postproc | 4.0 → 0.60 | **−3.4** |
+
+> 各段收益合计 −33.8ms，与 67→22.5（−44.5）的差额 ~10.7ms 为测量口径差（09-28 各值为 est. +
+> device 0 高负载 avg10；本轮 device 1 同 OM 基线实测 forward 仅 11.3，旧值 22.8 高估 ~11ms）。
+> 精度红线：33 框（Car 12/Ped 14/Cyc 7）与基线逐帧一致；设备常驻 ON/OFF（A/B 22.5 vs 23.7ms，净赚
+> ~1.2ms）、nblk 7/8 框表均逐字节一致。推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
 
 ### 1.4 topk 图内 OM（P2）全量管线口径验证（动态 18000，200 帧）
 
@@ -125,43 +140,6 @@ E2E 最优见 1.4；base 版为 `pointpillar_base_fp16_dynamic18000_force_linux_
 >   交付全量口径前建议补跑；
 > - 该轮（2026-09-28）体素化仍为 numba（AscendC 启用前的生产路由）；topk 前处理 37.5 vs base
 >   34.5 的 +3ms 未归因（前处理与 OM 无关，疑轮次噪声）。
-
-### 1.5 三线性能攻坚集成态（2026-09-29，perf/integrated → master `3ef09d9`）
-
-单帧 demo（000008.bin，M=7260，122555 点全量体素化，无 FOV），device 1，30 iters 稳态中位：
-
-| 段 | 09-28 口径 | **本轮集成态** | 优化来源 |
-|---|---|---|---|
-| 2.prepare_data | ~32（est.） | **9.62** | AscendC 体素化修复 + numba 单遍 mask + 设备常驻管线 |
-| 3.collate | 4.5 | **0.13** | 单帧 fast-path（双态：numpy / torch 设备常驻） |
-| 4.index_map/pad | 0.7 | 0.32 | device 侧构造 |
-| 5.feeds(H2D) | 2.4 | **0.41** | NPU tensor 经 `aclruntime.BaseTensor` 零拷贝直通 |
-| 7.OM 推理 | 22.8 | **10.97** | head 图手术 ABCD（同设备基线 11.32→9.60）+ 设备直通 D2D 代价 +1.4（净赚） |
-| 9.后处理 | 4.0 | **0.48** | numpy max/argmax + torch sigmoid + numba 增量 NMS 标量化 |
-| **E2E** | ~67（est.） | **22.5** | |
-
-三项根因 / 关键结论：
-
-1. **561000 修复**（unum_ops@bevpool-kernel-opt `387bb9e`）：aclruntime `session.run` 在调用线程
-   切换 device context **不还原** → torch_npu 流不在当前 context（107003 stream is not in current
-   context）→ ext 入口加 `ThreadCtxGuard`（SetDevice + 退出还原）；另 `MAX_NBLK 7→8`（`a8a101d`，
-   kernel 7.11→6.24ms）。
-2. **设备常驻管线**（`27bcb48`）：voxelization 输出保持 NPU tensor（BaseTensor 零拷贝 feeds），消除
-   D2H→numpy→H2D 往返；**GE 交接前必须 `torch.npu.synchronize()`**（collate/index_map 的异步 op
-   不在 GE 流上，不同步则 GE 读未写完内存 → 稳定 0 框）。`NPU_VOX_DEVICE_RESIDENT=0` 可整体回退
-   numpy 路径（A/B 实测 23.7ms，常驻净赚 ~1.2ms）。
-3. **head 图手术 ABCD**（`8b1e6d8`）：head 1x1 conv 合并 / 冗余类别 gather 消除 / ConvTranspose(4x4/s4)
-   → Conv1x1+DepthToSpace（mode 须写 **'CRD'**，CANN 语义与 ONNX 规范相反）/ TopK 4096→1024；均为
-   数学恒等变换，ORT fp32 bit-exact，NPU 输出与基线逐框一致（坐标偏差 0.000977 / score 0.000122）。
-   赢家 OM：`weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
-   证伪留档：7 种 ATC 精度/融合开关组合均无增益；全量 ConvTranspose pixelshuffle 重写慢 8 倍。
-
-**精度红线**：33 框（Car 12/Ped 14/Cyc 7）与基线逐帧一致；设备常驻 ON/OFF 逐字节一致；nblk 7/8 逐字节一致。
-
-**10ms 目标结论：当前 fp16 OM 路径不可达**。剩余硬墙：体素化 kernel 6.24ms（稳定 LSD 基数排序
-scalar_ratio 0.97，bit-exact 契约下需向量化重设计）、backbone conv 占 OM 44%（架构固有）、
-voxel→BEV scatter 1.26ms（mte2 单向 bound）。后续路径（按收益排序）：AMCT int8 量化（预期
-−1.5~2ms）、自定义 scatter 算子、kernel 向量化重写（独立迭代）——三项全走通乐观 ~13-15ms。
 
 ## 2. 前处理子环节拆分（000008，稳态）
 
@@ -194,6 +172,7 @@ voxel→BEV scatter 1.26ms（mte2 单向 bound）。后续路径（按收益排�
 | `pointpillar_base_fp16_dynamic18000_force_linux_aarch64.om` | 动态 M=1~18000 | 21.3 ms | 全量 val base 推荐（动态，无 pad 浪费） |
 | `pointpillar_base_fp16_static18000_force.om` | 静态 M=18000 | 19.7 ms | 全量 val 兼容（18000 覆盖所有帧，但总有 pad 浪费） |
 | `pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 4096） | 22.0 ms | **P2 topk 图内**，后处理 11.8→4ms，E2E 最优（1.4） |
+| `pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 1024） | **9.60 ms**（同设备对照）/ 10.97（集成态） | **09-29 head 图手术 ABCD**（head 1x1 合并/冗余 gather 消除/ConvTranspose→Conv1x1+DTS/TopK 4096→1024），输出逐框一致；当前 demo 推荐（§1.3/5.2） |
 
 ### 前向优化链（186ms → 24ms，7.8x）
 
@@ -231,7 +210,7 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 
 ## 5. 瓶颈剖析（当前）
 
-### 5.1 前处理（全量管线口径 ~37.5ms/帧，占 E2E ~59%；demo 口径 getitem ~32ms est.，占 ~48%）
+### 5.1 前处理（全量管线口径 09-28 值 ~37.5ms/帧（本轮未复测）；demo 口径 09-29 实测 10.0ms，占 E2E ~44%）
 
 子环节稳态耗时见 §2。当前构成（全量管线）：FOV numba ~30ms（本机 openblas64 单线程小 K 矩阵乘
 ~81ms/次，numba 规避）+ voxelize（AscendC 已启用，见下）+ pad/collate ~10ms。
@@ -246,21 +225,36 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
   - 红线通过：**200 帧 OM AP 与 numba 基线逐位一致**（diff=0）；比较/评测链路不受 voxel 行序影响。
   - 副作用：AscendC 会把 torch_npu 设备上下文拉进 aclruntime 进程，自然退出时双运行时 teardown 冲突
     会 segfault/bus error（结果已全部产出）；`om_ref_demo/om_ref_test` 结果输出后调 `npu_patch.hard_exit(0)` 硬退出。
-  - kernel 级优化**已实验为死路（2026-09-28）**：`MAX_NBLK=7` 是单 cube 8 AIV 验证上限；worktree 里把
-    `MAX_NBLK` 提到 15 重建安装实测**无提速**（21.8 vs 21.3ms）——kernel 受 12 次软件栅障（radix 多趟 + 全量
-    L1 dcci）+ 每调用 aclnn 两段式固定 ~5ms 串行化限制，**不是核数限制**；且 nblk>7 会改变 voxel 行序。
-    （顺带教训：CANN runtime 加载 `opp/vendors/` 下全部 vendor 的 op_api/opmaster，字母序后者覆盖，
+  - kernel 级优化：`MAX_NBLK=7` 曾为单 cube 8 AIV 验证上限；提到 15 实测无提速（21.8 vs 21.3ms）——
+    kernel 受 12 次软件栅障（radix 多趟 + 全量 L1 dcci）+ 每调用 aclnn 两段式固定 ~5ms 串行化限制，
+    **不是核数限制**。
+    （**09-29 修正**：`MAX_NBLK 7→8` 实有收益 kernel 7.11→6.24ms（−12%，物理 8 AIV，unum_ops `a8a101d`），
+    稳定 LSD 排序与分块数无关、框表逐字节一致——09-28「nblk>7 改变 voxel 行序」仅适用当时的 v1 实现；>8 仍无提速。）
+  - （vendor 管理教训：CANN runtime 加载 `opp/vendors/` 下全部 vendor 的 op_api/opmaster，字母序后者覆盖，
     `config.ini load_priority` 不控制 aclnn 符号解析；回滚 vendor 以 docker overlay2 diff 层为准，
     须 `diff -rq` 核对 + 重验 200 帧 AP。）
+  - **当前 demo 口径 prepare_data 10.0ms 构成（09-29）**：mask 0.28 + H2D 0.23 + ext 6.74（kernel 6.24）
+    + 管线残差 ~2.4；kernel 6.24ms 为**标量墙**（msprof scalar_ratio 0.97——稳定 LSD 基数排序 +
+    bit-exact IEEE fp32 真除法契约），<5ms 需向量化重设计（数值风险，独立迭代，见 §7）。
 - 剩余可优化：FOV/voxelize 并行；FOV 仍未 kernel 化（§7「AscendC 融合预处理算子」（方案 A）剩 FOV 部分）。
 
-### 5.2 推理（forward：17.5-22.0ms，视 OM 与 M 口径）
+### 5.2 推理（forward：17.5-22.0ms，视 OM 与 M 口径；09-29 手术后集成态 10.97ms）
 
 - 静态 9000 force_fp16 **17ms**（单帧最快）；静态 18000 19.7ms；动态 18000 21.3ms（base）/ 22.0ms（topk）。
 - 动态比静态多 `set_dynamic_shape` ~1.6ms 调度，但免静态总是处理 pad 行的浪费——E2E 上动态更优（见 1.2）。
 - op 级分布（fp32 静态 9000 口径）：剩 Conv2DTransposeD 7.3ms + Conv2D 3.6ms + GatherV2 2.9ms；
   fp16 后未重新 profiling。
 - 注：早期 P3 规划曾预期 fp16 ~12ms，实测 mixed 18ms / force 17ms，以实测为准。
+- **head 图手术 ABCD（09-29，`8b1e6d8`）**：数学恒等变换——A) 3 个 1x1 head conv 合并为 Conv 384→72+Slice；
+  B) 冗余类别 Gather 消除（Squeeze 替代，−915us）；C) ConvTranspose(4x4/s4)→Conv1x1(256→2048)+
+  DepthToSpace(4)（mode 须写 **'CRD'**，CANN 语义与 ONNX 规范相反，探针实测）；D) TopK 4096→1024。
+  同设备对照（device 2）11.32→**9.60ms（−15%）**，输出逐框一致（坐标 0.000977 / score 0.000122）；
+  集成态 10.97（device 1，含设备常驻 BaseTensor 的 GE 内部 D2D +1.4，host feeds 为 9.55）。
+  赢家 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
+- **msprof（基线 topk OM，device 2）**：AICPU 占比 ≈0；Conv 族合计 ~4.8ms / 10.8ms = **44%**
+  （Conv2D 2598us + Conv2DTransposeD 1866us）；GatherV2 voxel→BEV scatter 1260us（**mte2 99.6% 单向
+  bound**）；TransData ~800us。证伪留档：7 种 ATC 精度/融合开关组合均无增益；全量 ConvTranspose
+  pixelshuffle 重写慢 8 倍（DTS(2) 2272us ≫ 原生 273us）。
 
 ### 5.3 后处理（base 口径 15-16.5ms；topk 图内口径 3.5-4.0ms）
 
@@ -268,6 +262,9 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
   - **增量贪心旋转 NMS**（`_nms_incremental`，O(N·K) 替代 O(N²)，与全矩阵 bit 一致，1672→43ms 最坏）；
   - numpy `argpartition` topk + `tensor_to_numpy(copy=False)` 免 13MB memcpy + sigmoid 单调性优化。
 - topk 图内（P2）：TopK(4096) 移入图内，NMS 只吃 4096 行，D2H 13MB→164KB → **3.5-4.0ms**（见 1/1.4）。
+- **09-29 重构后 0.60ms**（含 D2H 0.12）：numpy max/argmax 替代 torch.max（省 ~3.8ms）；torch sigmoid
+  **保留**（numpy 版有 1ULP 差，为逐位一致不换）；NMS numba 标量化 0.57→0.21ms；D2H `copy=False`
+  host 缓冲直视。逐位一致性验证脚本 `npu/debug/verify_postproc_bitwise.py`。
 
 ## 6. 精度
 
@@ -292,19 +289,31 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 | ~~topk 图内化~~ | `--topk-only`：图内 ReduceMax+TopK(4096)，NMS 留 CPU | 后处理 15→**3.5ms** | ✅ 已测：E2E 73.1→**64.3ms**（force 基线；77.8 为更早 mixed v1 轮次），AP 与 base 完全一致；全量管线口径 63.3ms（动态 18000，200 帧） |
 | ~~NMS 图内化~~ | 图内 sigmoid+TopK+NMS | **无收益且不可行** | ❌ 图内全链使前向 24→47ms，劣于 base 24 + CPU 后处理 16.5 = 40.5ms；且 **310P 的 NonMaxSuppression IoU 抑制失效**（返回全部 max_out=500、无抑制，487 Car 重复 vs CPU 正确 32）；**框数硬限制 ≤50000**（PointPillar 321408 anchors 超限）导致输出完全垃圾。后处理留 CPU 为最优。 |
 | AscendC 融合预处理算子（方案 A） | FOV+mask+voxelize 单 AscendC kernel | 前处理 42→~5-10ms | ✅ voxelize 已 kernel 化并启用（2.5x，见 5.1）；剩 FOV 未 kernel 化；暂缓 |
-| ~~M≥18000 动态/静态 OM~~ | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force` / `fp16_dynamic18000_topk`） |
+| ~~体素化 561000 修复 + 设备常驻管线~~ | ThreadCtxGuard + numba 单遍 mask + BaseTensor 零拷贝 feeds | getitem 32→**10.0**、feeds 2.4→0.5 | ✅ 09-29（`27bcb48` + unum_ops `387bb9e`/`a8a101d`）；ON/OFF 框表逐字节一致（A/B 22.5 vs 23.7ms） |
+| ~~head 图手术 ABCD~~ | 1x1 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS / TopK 4096→1024 | forward 11.32→**9.60**（−15%） | ✅ 09-29（`8b1e6d8`），输出逐框一致；7 种 ATC 开关组合证伪无增益、全量 pixelshuffle 重写慢 8 倍 |
+| ~~collate / 后处理重构~~ | 单帧 fast-path（双态）+ numpy max + numba NMS 标量化 | 5.2→**0.45**、4.0→**0.60** | ✅ 09-29（`5eccc9b`），逐位一致（verify_postproc_bitwise.py） |
+| AMCT int8 量化（backbone conv） | conv 占 forward 44%，量化是唯一大幅压缩手段 | forward **−1.5~2ms** | 待办：10ms 路径上收益最大的一项 |
+| 自定义 voxel→BEV scatter 算子 | GatherV2 mte2 单向 bound（99.6%），融合写 kernel ~50% 空间 | ~−0.6ms | 待办 |
+| 体素化 kernel 向量化重写 | 标量排序墙 6.24ms（bit-exact 契约，见 5.1） | kernel →~4.6ms | 待办：数值风险，独立迭代；先行小步（fill 携数据/S1+hist0 融合/桶批 scatter）可先得 −1.6ms |
+| ~~M≥18000 动态/静态 OM~~ | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force` / `fp16_dynamic18000_topk`）；09-29 起推荐 surgery ABCD 版 |
 | 跨帧流水线 | async D2H 与下帧预处理重叠 | 只提 FPS | 单帧延迟无益 |
 
 ### 性能收益预估
 
 > 前两行为 200 帧静态 9000 口径（§1）；全量管线口径当前 63.3ms（1.4，体素化 numba），
-> AscendC 在 FOV 小输入上的收益未测。
+> AscendC 在 FOV 小输入上的收益未测。第三行起为 demo 单帧口径（§1.3）。
 
 | 组合 | 前处理 | 推理 | 后处理 | E2E |
 |---|---|---|---|---|
 | force_fp16（实测） | 41 ms | 17 ms | 15 ms | **73.1 ms** |
 | **force_fp16 + topk图内（实测）** | 43 ms | 17.5 ms | 3.5 ms | **64.3 ms** |
 | +AscendC 算子预处理（voxelize 已启用，FOV 待 kernel 化） | FOV 剩 ~30ms | 17.5 | 3.5 | 待 FOV kernel 化后 ~40ms |
+| **09-29 集成态（实测，demo 单帧口径）** | 10.0 ms | 11.0 ms | 0.6 ms | **22.5 ms** |
+| +int8 量化 + scatter 自定义 + kernel 向量化（全部待办落地） | ~8.4 | ~7.5 | 0.6 | **乐观 ~13-15 ms** |
+
+> **10ms 目标结论：当前 fp16 OM 路径不可达**——体素化 kernel 6.24ms 标量墙（bit-exact 契约）+
+> backbone conv 占 forward 44%（架构固有）+ scatter 1.26ms（mte2 单向 bound）；三项待办全部落地
+> 乐观 ~13-15ms（demo 单帧口径）。全量管线口径（200 帧）待数据集环境复测。
 
 ## 8. 测速方法
 
@@ -312,8 +321,12 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 # 单帧 demo（含前/后处理，000008 pad 到 9000）——注意 demo 无 FOV，体素化 122555 点
 python npu/om_ref_demo.py --om weights/pointpillar_base_fp32_static9000_v2.om
 
-# 单帧完整推理延迟（topk 动态；AscendC 体素化前 ~87ms，后 est. ~67ms；含 getitem 体素化）
-python npu/om_ref_demo.py --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om
+# 单帧完整推理延迟（推荐 surgery ABCD OM；09-29 集成态实测 22.5ms，30 iters 中位）
+python npu/om_ref_demo.py --data_path <bin 或目录> --om weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om
+
+# E2E 九段分段计时（demo 单帧，支持 BENCH_OM/BENCH_DEVICE/BENCH_ITERS 环境变量；
+# NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线做 A/B）
+BENCH_OM=weights/<om> BENCH_DEVICE=1 BENCH_ITERS=30 python npu/debug/perf_e2e_topk.py
 
 # E2E 分段计时（200 帧，输出 前处理/推理/后处理 拆分 + 官方 AP）——全量管线口径（有 FOV）
 python npu/om_ref_test.py --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om --frames 200

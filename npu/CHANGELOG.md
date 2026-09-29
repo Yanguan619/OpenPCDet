@@ -32,7 +32,7 @@
   常驻），bench `voxelize_tensors`/feeds 双态合并；最终单帧 E2E **22.5ms**（中位，device 1），33 框；
   `NPU_VOX_DEVICE_RESIDENT=0` 可整体回退 numpy 路径（A/B 23.7ms）。
 - **10ms 结论**：当前 fp16 OM 路径不可达——体素化 kernel 6.24ms 标量排序墙 + backbone conv 44% +
-  scatter 1.26ms；后续 int8 量化 / 自定义 scatter / kernel 向量化，乐观 ~13-15ms（PERFORMANCE.md §1.5）。
+  scatter 1.26ms；后续 int8 量化 / 自定义 scatter / kernel 向量化，乐观 ~13-15ms（PERFORMANCE.md §1.3/§7）。
 
 ### ✅ AscendC voxelize 启用（2026-09-28）
 
