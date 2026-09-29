@@ -3,6 +3,7 @@
 用法:
     BENCH_DEVICE=1 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
     # 静态 OM（expect_m>0）自动走 pad 分支
+    # NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线（回退 numpy 路径做 A/B）
 """
 import os
 import sys
@@ -11,6 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+# 设备常驻管线：voxelization 输出保持 NPU tensor（collate/index_map/feeds 全程
+# device 侧），消除 D2H→numpy→collate→H2D 往返。须在 import npu_patch 前设置。
+os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
 import npu.npu_patch  # noqa: E402,F401  预注入 stub，必须在 import pcdet 之前
 
 import aclruntime
@@ -21,7 +25,7 @@ from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
 from npu.om_ref_demo import (DemoDataset, to_tensor, build_index_map, pad_to_static_m,
-                             tensor_to_numpy, nms_topk_numpy)
+                             tensor_to_numpy, nms_topk_numpy, mkfeeds, coords_int32)
 
 OM = ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om'
 BIN = ROOT / '000008.bin'
@@ -32,6 +36,10 @@ SKIP = 3  # 预热帧不计入统计
 
 
 def main():
+    # 必修：patched generate() 的 .npu() 默认走 device 0，必须与 BENCH_DEVICE
+    # 对齐（否则算子跑在 device 0、OM 跑在 device 1，跨设备错位）。
+    if getattr(torch, 'npu', None) is not None and torch.npu.is_available():
+        torch.npu.set_device(DEVICE)
     os.chdir(str(ROOT / 'tools'))  # 与 demo 一致：_BASE_CONFIG_ 相对 tools/ 解析
     cfg_from_yaml_file(str(CFG), cfg)
     logger = common_utils.create_logger()
@@ -79,7 +87,7 @@ def main():
         def voxelize_tensors():
             voxels = to_tensor(data_dict['voxels'])
             vnp = to_tensor(data_dict['voxel_num_points'])
-            vco = to_tensor(data_dict['voxel_coords'].astype(np.int32))
+            vco = to_tensor(coords_int32(data_dict['voxel_coords']))
             if is_dynamic:
                 bim = build_index_map(vco, M=voxels.shape[0])
             else:
@@ -90,15 +98,8 @@ def main():
         voxels, vnp, vco, bim = timed('4.tensor+index_map/pad', voxelize_tensors, rec)
         M = voxels.shape[0]
 
-        def mkfeeds():
-            fs = [aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(vnp.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(vco.numpy())),
-                  aclruntime.Tensor(np.ascontiguousarray(bim.numpy()))]
-            for t in fs:
-                t.to_device(DEVICE)
-            return fs
-        feeds = timed('5.feeds构造+to_device(H2D)', mkfeeds, rec)
+        feeds = timed('5.feeds构造+to_device(H2D)',
+                      lambda: mkfeeds(voxels, vnp, vco, bim, DEVICE), rec)
 
         if is_dynamic:
             def setdym():
