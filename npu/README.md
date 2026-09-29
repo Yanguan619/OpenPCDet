@@ -184,11 +184,15 @@ python npu/om_ref_test.py --om weights/<你的 om>.om
 
 ## 性能结论（摘要）
 
-- **数据集全量口径**（有 FOV，动态 18000 topk fp16）：E2E **63.3 ms/帧**（前处理 37.5 + 推理 22 + 后处理 4）。
-- **单帧 demo 完整推理**（无 FOV，含体素化 122555 点）：**~67 ms**（est.，体素化切 AscendC 后；原 numba ~93ms，静机待重测）。
-- 基线 369ms（2026-09-22 全量）→ 当前 63.3ms，累计 **5.8x**。
-- 瓶颈在 host 侧前处理（FOV + voxelize），NPU 推理仅占 ~35%。
-- 详细见 `npu/PERFORMANCE.md`。
+- **单帧 demo 完整推理**（无 FOV，体素化 122555 点）：**22.5 ms**（2026-09-29 集成态实测，device 1
+  稳态中位；推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`）。
+- 演进：~93ms（numba 体素化）→ ~67ms（AscendC 体素化）→ **22.5ms**（体素化 561000 修复 + 设备常驻
+  管线 + head 图手术 ABCD + CPU 后处理重构）；检测输出与基线逐帧一致（33 框）。
+- **数据集全量口径**（有 FOV，200 帧）：63.3 ms/帧（2026-09-28 测；本轮各段优化尚未在全量口径复测）。
+- 基线 369ms（2026-09-22 全量）→ 63.3ms，累计 **5.8x**（全量口径）。
+- 当前瓶颈：OM 推理 ~11ms（backbone conv 占 44% + scatter 1.26ms）与体素化 kernel 6.24ms（标量排序墙）；
+  **10ms 目标在当前 fp16 OM 路径不可达**，后续需 int8 量化 / 自定义 scatter / kernel 向量化（详见
+  `npu/PERFORMANCE.md` §1.5）。
 
 ## 文档索引
 

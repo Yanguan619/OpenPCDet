@@ -8,6 +8,32 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 三线性能攻坚 + 集成（2026-09-29，单帧 E2E ~67→22.5ms）
+
+并行三线（各自 worktree/分支），全部合入 master（`3ef09d9`），检测输出与基线逐帧一致（33 框）：
+
+- **体素化**（perf/voxelize-npu `27bcb48` + unum_ops `387bb9e`/`a8a101d`）：
+  - **561000 根因**：aclruntime `session.run` 切换线程 device context 不还原 → torch_npu 流不在
+    当前 context（107003）；ext 入口加 `ThreadCtxGuard`（SetDevice+退出还原）修复；
+  - numba mask 单遍压缩 3.2→0.28ms（只比 x/y，与原版逐位一致）；
+  - **设备常驻管线**：voxelization 输出保持 NPU tensor，`mkfeeds` 用 `aclruntime.BaseTensor`
+    零拷贝直通，消除 D2H→numpy→H2D 往返；**GE 交接前 `torch.npu.synchronize()` 必需**
+    （异步 op 不在 GE 流上，不同步 GE 读未写完内存 → 稳定 0 框）；
+  - `MAX_NBLK 7→8`：kernel 7.11→6.24ms；demo/bench 补 `torch.npu.set_device` 对齐；
+  - stage2 32.7→9.8ms；设备常驻 ON/OFF、nblk 7/8 框表均逐字节一致。
+- **OM 图手术**（perf/om-opt `8b1e6d8`）：head 图手术 ABCD（1x1 conv 合并 / 冗余 gather 消除 /
+  ConvTranspose→Conv1x1+DepthToSpace / TopK 4096→1024，数学恒等、ORT fp32 bit-exact），
+  stage7 11.32→9.60ms（device 2 同设备对照），输出逐框一致（坐标 0.000977 / score 0.000122）。
+  证伪：7 种 ATC 开关组合无增益、全量 pixelshuffle 重写慢 8 倍；CANN DepthToSpace mode 语义与
+  ONNX 规范相反（规范 DCR 须写 'CRD'）。赢家 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
+- **CPU 后处理**（perf/postproc `5eccc9b`）：collate 单帧 fast-path（0.15ms）+ numpy max/argmax
+  （torch sigmoid 保留保 1ULP 一致）+ numba NMS 标量化（0.57→0.21ms）；stage3+5+9 14→3.35ms，逐位一致。
+- **集成**（perf/integrated → master `3ef09d9`）：`collate_batch_fast` 升级双态（numpy / torch 设备
+  常驻），bench `voxelize_tensors`/feeds 双态合并；最终单帧 E2E **22.5ms**（中位，device 1），33 框；
+  `NPU_VOX_DEVICE_RESIDENT=0` 可整体回退 numpy 路径（A/B 23.7ms）。
+- **10ms 结论**：当前 fp16 OM 路径不可达——体素化 kernel 6.24ms 标量排序墙 + backbone conv 44% +
+  scatter 1.26ms；后续 int8 量化 / 自定义 scatter / kernel 向量化，乐观 ~13-15ms（PERFORMANCE.md §1.5）。
+
 ### ✅ AscendC voxelize 启用（2026-09-28）
 
 - **改动**：`npu_patch._patch_voxelize_ascendc`（unum_ops，commit 6b90b4e）从「仅 `init_patch()` 触发」改为
