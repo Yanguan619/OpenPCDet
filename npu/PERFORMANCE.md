@@ -202,7 +202,8 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 ## 4. 全量 val 集（3769 帧）注意
 
 - **静态 9000 OM 只覆盖 M≤9000 的帧**：100 帧随机抽样中 54% 帧 M>9000（最大 ~16664）→ 全量 val 需
-  **M≥18000 静态 OM** 或 **动态 OM（range 加大）**。转换命令已备于 `npu/convert_fp16_static9000.sh`。
+  **M≥18000 静态 OM** 或 **动态 OM（range 加大）**（当前链路：动态 OM，见 README 模型转换节；静态 9000
+  转换脚本已随历史 OM 删除，需要时从 git 历史取回）。
   （注意：§1 的 200 帧子集为 val **前** 200 帧，恰好全部 M≤9000（skipped_M=0），与随机抽样分布不同；
   1.1 的 "M 平均 ~8000" 与本条 54%>9000 口径未对齐，待统一重测。）
 - 全量 val 200 帧基准 AP（静态 9000，fp32）：Car 77.90 / Ped 57.95 / Cyc 37.05（与官方基线 1% 内）。
@@ -322,9 +323,6 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 ## 8. 测速方法
 
 ```bash
-# 单帧 demo（含前/后处理，000008 pad 到 9000）——注意 demo 无 FOV，体素化 122555 点
-python npu/om_ref_demo.py --om weights/pointpillar_base_fp32_static9000_v2.om
-
 # 单帧完整推理延迟（默认即 surgery ABC OM；09-29 集成态实测 22.5ms，30 iters 中位，ABCD 口径）
 python npu/om_ref_demo.py --data_path <bin 或目录>
 

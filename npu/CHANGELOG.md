@@ -8,6 +8,13 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 删除 static9000 历史三件套（2026-09-29）
+
+- **删除** `convert_fp16_static9000.sh` + `mix_fp16_static9000.json` / `mix_fp16_static9000_v2.json`：
+  静态 M=9000 OM 的转换脚本与 ATC mixlist，当前链路（动态 OM，`export_onnx.py --surgery` 一条命令
+  + ATC range 记法）完全不用；PERFORMANCE.md §2 的历史测量数据保留，仅去掉脚本引用
+  （§4/§8 引用同步更新，需要时脚本从 git 历史取回）。
+
 ### ✅ 删除相邻 checkout 的 sys.path.insert 死代码（2026-09-29）
 
 - **问题**：`npu_patch.py` / `export_onnx.py` / `om_ref_test.py` / `om_ref_test_pt.py` 里的
