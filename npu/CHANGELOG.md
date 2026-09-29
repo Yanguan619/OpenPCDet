@@ -8,6 +8,18 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 删除相邻 checkout 的 sys.path.insert 死代码（2026-09-29）
+
+- **问题**：`npu_patch.py` / `export_onnx.py` / `om_ref_test.py` / `om_ref_test_pt.py` 里的
+  `sys.path.insert(0, ROOT.parent/"unum_ops"/"src"/"unum_ops")` 是 pip 安装前"相邻 checkout 直接跑"
+  时代的残留，且**从未生效过**：插的是包目录本身，`import unum_ops` 需要父目录
+  （`python -S` 隔离 site-packages 后仍 ImportError，实锤）；实际解析一直靠
+  `pip install -e /workspace/unum_ops` 的 editable finder（指向同一棵源码树）。
+- **风险**：留着会给人"不装 unum_ops 也行"的错误暗示，并埋下"相邻树 vs 安装副本"两份真相的隐患，
+  违背"用的哪个就是哪个"原则。
+- **改动**：4 处 insert 全删；unum_ops 唯一解析路径 = pip 安装（README 安装依赖小节即如此要求）。
+- **验证**：单帧 demo（000008.bin）回归——AscendC 体素化横幅正常、OM 推理 33 框与基线一致。
+
 ### ✅ surgery_heads.py 并入 export_onnx.py：转换链收敛为一条命令（2026-09-29）
 
 - **动机**：ONNX 图手术（A/B/C）本质是 topk-only 图的后处理，与 `export_onnx.py` 既有的

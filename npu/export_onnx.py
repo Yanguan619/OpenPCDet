@@ -24,7 +24,6 @@ from onnx import helper, numpy_helper, TensorProto, mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
 import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 

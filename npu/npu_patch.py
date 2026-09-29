@@ -18,8 +18,7 @@ import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
+sys.path.insert(0, str(ROOT))  # unum_ops 一律走 pip 安装（editable）解析，不做相邻 checkout 的 sys.path 兜底
 
 import numba
 import numpy as np

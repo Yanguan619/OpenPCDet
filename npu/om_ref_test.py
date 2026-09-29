@@ -27,7 +27,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
 # 设备常驻管线：voxelization 输出保持 NPU tensor（collate/index_map/feeds 全程 device 侧），
 # 消除 D2H→numpy→H2D 往返。须在 import npu_patch 前设置；=0 可回退 numpy 路径做 A/B。
