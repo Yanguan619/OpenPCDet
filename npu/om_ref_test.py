@@ -13,10 +13,15 @@
 说明:
     - 复用同一个 InferenceSession，静态/动态 shape OM 均支持（动态 OM 无 M 跳过）。
     - 默认输出官方 AP；--quick 走简化 BEV IoU(0.5) 匹配（快速 sanity check）。
-    - 运行时间估计: 3769 帧 * ~370ms ≈ 23 分钟（单进程，含官方评测）。
+    - **EP 设备适配（2026-09-29）**：feeds 每帧经 mkfeeds 显式上设备——host tensor → to_device，
+      NPU tensor → BaseTensor 零拷贝 + torch.npu.synchronize。此前仅第 0 帧 warmup 时 to_device，
+      其余帧 host tensor 直传 session.run：RC 设备（统一内存，设备可直接 DMA 读 host）可跑，
+      EP 设备（独立显存）host 指针设备不可达 → MTE DDR 越界 500002（同 demo 68defbf 的坑）。
+    - 运行时间估计: 3769 帧 * ~50ms ≈ 3-4 分钟（09-29 集成态路径）+ 官方评测耗时。
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "unum_ops" / "src" / "unum_ops"))
 
+# 设备常驻管线：voxelization 输出保持 NPU tensor（collate/index_map/feeds 全程 device 侧），
+# 消除 D2H→numpy→H2D 往返。须在 import npu_patch 前设置；=0 可回退 numpy 路径做 A/B。
+os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
 import npu.npu_patch  # noqa: E402,F401  预注入 CUDA ops 降级 stub，必须在 import pcdet 之前
 
 import aclruntime
@@ -43,6 +51,10 @@ from npu.om_ref_demo import (
     tensor_to_numpy,
     nms_topk_numpy,
     load_kitti_labels,
+    collate_batch_fast,
+    coords_int32,
+    mkfeeds,
+    postprocess_topk,
 )
 
 NUM_ANCHORS = 321408
@@ -270,10 +282,13 @@ def main():
             except Exception:
                 pass
         data_dict = demo_dataset.prepare_data(data_dict={"frame_id": fid, "points": points, "use_lead_xyz": True})
-        data_dict = demo_dataset.collate_batch([data_dict])
+        # 单帧 fast-path（双态：numpy / torch 设备常驻，同 demo/bench）
+        data_dict = collate_batch_fast([data_dict])
 
+        # 双态张量：设备常驻模式下为 NPU tensor（to_tensor 直通），否则 CPU tensor
         voxels = to_tensor(data_dict["voxels"])
-        voxel_coords = to_tensor(data_dict["voxel_coords"].astype(np.int32))
+        voxel_num_points = to_tensor(data_dict["voxel_num_points"])
+        voxel_coords = to_tensor(coords_int32(data_dict["voxel_coords"]))
         M = voxels.shape[0]
         if expect_m is not None and expect_m > 0:
             # 静态 shape OM：M < 固定值时 pad，M 超限则跳过
@@ -282,24 +297,16 @@ def main():
                 if len(skip_log) < 10:
                     skip_log.append("%s (M=%d)" % (fid, M))
                 continue
-            voxel_num_points = to_tensor(data_dict["voxel_num_points"])
             voxels, voxel_num_points, voxel_coords, bev_index_map = pad_to_static_m(
                 voxels, voxel_num_points, voxel_coords, expect_m
             )
         else:
             bev_index_map = build_index_map(voxel_coords, M=M)
-            voxel_num_points = to_tensor(data_dict["voxel_num_points"])
-        feeds = {
-            "voxels": aclruntime.Tensor(np.ascontiguousarray(voxels.numpy())),
-            "voxel_num_points": aclruntime.Tensor(np.ascontiguousarray(voxel_num_points.numpy())),
-            "voxel_coords": aclruntime.Tensor(np.ascontiguousarray(voxel_coords.numpy())),
-            "bev_index_map": aclruntime.Tensor(np.ascontiguousarray(bev_index_map.numpy())),
-        }
+        # EP 适配：feeds 每帧显式上设备（host → to_device；NPU → BaseTensor+synchronize）。
+        # RC 设备（统一内存）host 直传可跑；EP（独立显存）host 指针设备不可达 → 500002。
+        feeds = mkfeeds(voxels, voxel_num_points, voxel_coords, bev_index_map, args.device)
         _set_dynamic_shape(M)
         if i == 0:
-            for _key, _t in feeds.items():
-                if hasattr(_t, "to_device"):
-                    _t.to_device(args.device)
             session.run(out_names, feeds)  # warmup
         t_pre += time.perf_counter() - t_a
 
@@ -312,12 +319,8 @@ def main():
         t_c = time.perf_counter()
         om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, -1, 7)
         om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, -1, 3)
-        cls_max, label = torch.max(torch.from_numpy(om_cls[0]), dim=-1)
-        label = label + 1
-        scores = torch.sigmoid(cls_max)
-        selected, scores = nms_topk_numpy(om_box[0], scores, score_thresh, nms_config)
-        boxes = om_box[0][selected]
-        labels = label[selected].numpy()
+        # 与 demo 同款后处理（numpy max/argmax + torch sigmoid + numba 增量 NMS，逐位一致）
+        boxes, labels, scores = postprocess_topk(om_box, om_cls, score_thresh, nms_config)
         t_post += time.perf_counter() - t_c
         preds_by_frame[fid] = (boxes, labels, scores)
 
