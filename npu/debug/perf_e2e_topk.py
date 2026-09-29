@@ -2,7 +2,8 @@
 
 用法:
     BENCH_DEVICE=1 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
-    # 静态 OM（expect_m>0）自动走 pad 分支
+    BENCH_OM=/path/to/model.om BENCH_DEVICE=2 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
+    # BENCH_OM 覆盖 OM 路径（默认原值）；静态 OM（expect_m>0）自动走 pad 分支
 """
 import os
 import sys
@@ -24,7 +25,7 @@ from npu.om_ref_demo import (DemoDataset, to_tensor, build_index_map, pad_to_sta
                              tensor_to_numpy, nms_topk_numpy, collate_batch_fast,
                              postprocess_topk)
 
-OM = ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om'
+OM = Path(os.environ.get('BENCH_OM', ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om'))
 BIN = ROOT / '000008.bin'
 CFG = ROOT / 'tools/cfgs/kitti_models/pointpillar.yaml'
 DEVICE = int(os.environ.get('BENCH_DEVICE', '0'))
