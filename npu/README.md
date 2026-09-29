@@ -26,7 +26,7 @@ cd unum_ops && pip install -e .
 ```
 
 - `pip install` 时 hatch_build 钩子会**自动构建并安装 AscendC OPP 包**（`csrc/ascend/voxelization_v2` → CANN `opp/vendors/`），需 CANN 环境可用（`ASCEND_HOME_PATH`）。
-- 无 CANN / OPP 构建失败时不影响 Python 侧 spconv/numpy shim（体素化自动回退 CPU numba，功能可用）。
+- 无 CANN / OPP 构建失败时不影响 Python 侧 spconv/numpy shim；体素化**固定走 AscendC NPU kernel**（无回退无开关）——unum_ops/OPP 缺失或版本过旧会在 `import npu_patch` 时直接 ImportError，运行期算子异常带栈抛出，**不会静默换 CPU numba**。启动时打印一行当前 voxelize 模式。
 - 不装 unum_ops 则 `from spconv.utils import VoxelGeneratorV2` 会 ImportError（除非另装原生 spconv）——unum_ops 是必需依赖。
 
 ### 2. 权重与 OM（自行生成）

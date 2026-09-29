@@ -50,62 +50,49 @@ def _patch_voxelize_ascendc():
 
     输出与 CPU numba 版**排序等价**（coord 多重集相同、同 coord 特征/npp 相同）但行序不同，
     coords 序为 (x,y,z) → 转回 spconv 的 (z,y,x)；端到端 200 帧 OM AP 与 numba 基线
-    逐位一致（红线通过）。全量点（demo 无 FOV）~2.5x 快，FOV 后小输入持平。任何异常
-    自动回退 CPU 原路径（首次回退打印警告，不静默）。可用环境变量 NPU_ASCENDC_VOXELIZE=0
-    关闭。幂等，可重复调用。
+    逐位一致（红线通过）。全量点（demo 无 FOV）~2.5x 快，FOV 后小输入持平——
+    AscendC 全面不劣于 numba，故为**唯一实现**：无回退、无开关，
+    unum_ops/OPP 缺失在 import 时直接 ImportError，运行期异常（如旧 OPP 的
+    561000 context bug）带栈抛出，任何帧都不换 numba。
+    幂等，可重复调用。
     """
-    global _VOXELIZE_PATCHED, _VOX_ORIG_GENERATE
+    global _VOXELIZE_PATCHED
     if _VOXELIZE_PATCHED:
         return
-    if os.environ.get('NPU_ASCENDC_VOXELIZE', '1') != '1':
-        return
-    try:
-        from unum_ops.voxelization.voxelization_ascendc_v2 import voxelization
-        from unum_ops.spconv.utils import VoxelGeneratorV2
-    except Exception:
-        return
-    _orig_generate = VoxelGeneratorV2.generate
-    _VOX_ORIG_GENERATE = _orig_generate
+    _VOXELIZE_PATCHED = True
+    from unum_ops.voxelization.voxelization_ascendc_v2 import voxelization
+    from unum_ops.spconv.utils import VoxelGeneratorV2
 
     def generate(self, points):
-        try:
-            p = torch.from_numpy(np.ascontiguousarray(points, dtype=np.float32)).npu()
-            out = voxelization(
-                p,
-                voxel_size=[float(v) for v in self.voxel_size],
-                pcr=[float(v) for v in self.point_cloud_range],
-                max_num_points=self.max_num_points,
-                max_voxels=self.max_voxels,
-            )
-            if _VOX_DEVICE_RESIDENT:
-                # 设备常驻：输出保持 NPU tensor（下游 collate/index_map/feeds 由
-                # 配套 patch 走 torch/aclruntime.BaseTensor 路径），消除
-                # D2H→numpy→H2D 往返。coords 的 (x,y,z)→(z,y,x) 换列在 device
-                # 侧完成，值与 numpy 版逐位一致。
-                return {
-                    'voxels': out.voxels,
-                    'coordinates': out.coords[:, [2, 1, 0]].contiguous(),
-                    'num_points_per_voxel': out.num_points,
-                }
+        p = torch.from_numpy(np.ascontiguousarray(points, dtype=np.float32)).npu()
+        out = voxelization(
+            p,
+            voxel_size=[float(v) for v in self.voxel_size],
+            pcr=[float(v) for v in self.point_cloud_range],
+            max_num_points=self.max_num_points,
+            max_voxels=self.max_voxels,
+        )
+        if _VOX_DEVICE_RESIDENT:
+            # 设备常驻：输出保持 NPU tensor（下游 collate/index_map/feeds 由
+            # 配套 patch 走 torch/aclruntime.BaseTensor 路径），消除
+            # D2H→numpy→H2D 往返。coords 的 (x,y,z)→(z,y,x) 换列在 device
+            # 侧完成，值与 numpy 版逐位一致。
             return {
-                'voxels': out.voxels.cpu().numpy(),
-                'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
-                'num_points_per_voxel': out.num_points.cpu().numpy(),
+                'voxels': out.voxels,
+                'coordinates': out.coords[:, [2, 1, 0]].contiguous(),
+                'num_points_per_voxel': out.num_points,
             }
-        except Exception as e:
-            global _VOX_FALLBACK_WARNED
-            if not _VOX_FALLBACK_WARNED:
-                print(f'[npu_patch] AscendC voxelize 回退 CPU numba（首次）: '
-                      f'{type(e).__name__}: {e}', flush=True)
-                _VOX_FALLBACK_WARNED = True
-            return _orig_generate(self, points)
+        return {
+            'voxels': out.voxels.cpu().numpy(),
+            'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
+            'num_points_per_voxel': out.num_points.cpu().numpy(),
+        }
 
     VoxelGeneratorV2.generate = generate
-    _VOXELIZE_PATCHED = True
+    print(f'[npu_patch] voxelize = AscendC NPU kernel（unum_ops.voxelization_ascendc_v2, '
+          f'device_resident={"on" if _VOX_DEVICE_RESIDENT else "off"}）', flush=True)
 
 _VOXELIZE_PATCHED = False
-_VOX_FALLBACK_WARNED = False
-_VOX_ORIG_GENERATE = None
 
 # 设备常驻模式：voxelization 输出以 NPU tensor 直通 collate/index_map/feeds，
 # 消除 D2H→numpy→collate 拷贝→H2D 往返（省 ~4-5ms）。由调用脚本在 import 本模块
@@ -924,7 +911,8 @@ patch_cuda_ops()
 
 # 生产链路（om_ref_demo/om_ref_test/om_ref_test_pt 等）只 import 本模块、不调 init_patch()，
 # 故在此 import 时即：① alias spconv→unum_ops shim（否则顶层 spconv 与 unum_ops.spconv 是两份拷贝，
-# patch 打不到消费者用的类）；② 启用 AscendC 体素化；NPU_ASCENDC_VOXELIZE=0 可关闭（自动回退 CPU numba）。
+# patch 打不到消费者用的类）；② 体素化固定路由 AscendC（唯一实现，无回退无开关，
+# unum_ops/OPP 为硬依赖，缺失 import 即报错）。
 # ③ numba 单遍 mask（值与原版逐位一致，NPU_NUMBA_MASK=0 关闭）；
 # ④ 设备常驻 collate（NPU_VOX_DEVICE_RESIDENT=1 时启用 tensor-aware collate_batch）。
 # ①②③ 必须在任意 DataProcessor/DemoDataset 构造之前生效（processor 以 partial

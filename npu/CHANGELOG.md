@@ -34,17 +34,30 @@
 - **10ms 结论**：当前 fp16 OM 路径不可达——体素化 kernel 6.24ms 标量排序墙 + backbone conv 44% +
   scatter 1.26ms；后续 int8 量化 / 自定义 scatter / kernel 向量化，乐观 ~13-15ms（PERFORMANCE.md §1.3/§7）。
 
+### ✅ 体素化固定 AscendC：去除回退与开关（2026-09-29）
+
+「用的哪个就是哪个」：AscendC 已验证全面不劣于 numba（demo 全量点 2.5x、FOV 小输入持平、
+200 帧 OM AP 逐位一致），故 `_patch_voxelize_ascendc` 删除 `NPU_ASCENDC_VOXELIZE` 开关、
+import try/except 与运行期回退——**唯一实现，任何帧都不换 numba**：
+
+- unum_ops/OPP 缺失：`import npu_patch` 时直接 ImportError（unum_ops 为硬依赖，README §1）；
+- 运行期异常（如旧 OPP 的 561000 context bug）：带原始栈抛出；
+- 启动打印一行 `voxelize = AscendC NPU kernel`，日志可核对当前模式。
+
+动机：静默回退曾把环境问题（旧 OPP、561000）伪装成「只是变慢」，RC/EP 新设备全量跑完才暴露。
+改动：`npu/npu_patch.py`、`npu/README.md` §1、`npu/PERFORMANCE.md` §5.1。
+
 ### ✅ AscendC voxelize 启用（2026-09-28）
 
 - **改动**：`npu_patch._patch_voxelize_ascendc`（unum_ops，commit 6b90b4e）从「仅 `init_patch()` 触发」改为
   **`import npu_patch` 时直接启用**——原路由一直休眠，生产链路实际跑 CPU numba（om_ref_demo/test/test_pt
-  只 import npu_patch 从不调 init_patch）。`NPU_ASCENDC_VOXELIZE=0` 可关闭回退 numba。
+  只 import npu_patch 从不调 init_patch）。09-29 起固定 AscendC、去除回退与开关（见下条）。
 - **别名修复**：`_alias_spconv` 由 `setdefault` 改**强制赋值**——unum_ops 导入时会经 sparse_modules.py:229
   `import spconv.pytorch` 触发顶层 `import spconv`，产生与 `unum_ops.spconv` 同路径的**第二份拷贝**，
   setdefault 因拷贝已存在而静默失效，patch 落在 unum_ops 副本、下游拿到的是未 patch 的顶层副本（类不同名）。
 - **性能**（demo 000008，M=7260，全量 122555 点）：generate **AscendC ~25ms vs numba ~45-53ms（2.5x）**。
   早前「无提速/更慢」结论为跨进程噪声 + wrapper `except Exception` **静默回退 numba** 假象（op 抛异常被吞掉），
-  已加回退日志不再静默。
+  当时的修复是加回退日志；09-29 起彻底去除回退（见下条）。
 - **精度**：voxel 逐帧**排序等价**（sorted-equal，coord 多重集相同、同 coord 特征/npp 相同）但行序与 numba 不同；
   200 帧中 199 帧 sorted-equal，frame 38 少 1 个越界边界体素（coord z=432 超出 BEV 网格，不影响输出）；
   **200 帧 OM AP 与 numba 基线逐位一致（diff=0）**。（早期「voxel diff=0 逐位一致」表述过于乐观，以本节口径为准。）

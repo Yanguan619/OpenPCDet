@@ -217,9 +217,10 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 
 - **AscendC voxelize 已启用（2026-09-28）**：`npu_patch._patch_voxelize_ascendc`（unum_ops，commit 6b90b4e）改为
   `import npu_patch` 时直接启用（不再只挂在 `init_patch()`，路由此前一直休眠，生产链路实际跑 numba）；
-  `NPU_ASCENDC_VOXELIZE=0` 可关闭回退 numba。
+  2026-09-29 起固定 AscendC 为唯一实现：无回退、无开关，unum_ops/OPP 缺失或运行失败直接报错。
   - demo 全量点（000008，M=7260）实测 generate：**AscendC 21.3ms vs numba 53.4ms（~2.5x）**；
-    早前测出的「无提速/更慢」是跨进程噪声 + wrapper `except` 静默回退 numba 假象（现已加回退日志，不再静默）。
+    早前测出的「无提速/更慢」是跨进程噪声 + wrapper `except` 静默回退 numba 假象
+    （根因即此回退，09-29 起已彻底去除）。
   - 正确性口径：voxel 逐帧**排序等价**（sorted-equal：coord 多重集相同、同 coord 特征/npp 相同）但**行序与 numba 不同**；
     200 帧中 199 帧 sorted-equal，frame 38 少 1 个越界边界体素（coord z=432 超出 BEV 网格，不影响输出）。
   - 红线通过：**200 帧 OM AP 与 numba 基线逐位一致**（diff=0）；比较/评测链路不受 voxel 行序影响。
