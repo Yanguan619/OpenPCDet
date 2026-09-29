@@ -10,7 +10,8 @@ C. convtranspose2_pixelshuffle: 仅把 4x4/s4 的 /ConvTranspose_2 重写为
    必须用 mode='CRD' 才是规范 DCR（已用 310P 探针 OM 实测）。
 D. topk_k_1024: TopK 的 K 常量 4096→1024（topk_topk 输入 'topk_k'）。
 
-用法: python3 npu/debug/surgery_heads.py --out om_out/pp_merged.onnx --do ABC
+用法: python3 npu/surgery_heads.py --in weights/pointpillar_nms_base_v2_dynamic_topk.onnx \
+          --out weights/pp_surgery_abc.onnx --do ABC
 """
 import argparse
 import numpy as np
@@ -19,7 +20,7 @@ from onnx import helper, numpy_helper
 
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def replace_output_edge(g, old, new):
@@ -155,7 +156,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--in', dest='inp', default=str(ROOT / 'weights/pointpillar_nms_base_v2_dynamic_topk.onnx'))
     ap.add_argument('--out', default=str(ROOT / 'om_out/pp_surgery.onnx'))
-    ap.add_argument('--do', default='ABCD', help='要做的手术，如 ABC / ABCD / C')
+    ap.add_argument('--do', default='ABC', help='要做的手术组合，如 ABC（推荐）/ C；D 已弃用（TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧截断风险）')
     args = ap.parse_args()
 
     model = onnx.load(args.inp)

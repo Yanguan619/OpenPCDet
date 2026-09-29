@@ -8,6 +8,17 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 清理 npu/debug/ + README 单一路径化（2026-09-29）
+
+- **删除 `npu/debug/`**（20 个历史/辅助脚本：infer/eval/quick_eval/atc 封装、compare_*/perf_*/
+  om_loop、export_full/postproc、verify_* 等，含九段计时的 perf_e2e_topk.py；需要时从 git 历史取回）。
+- **保留 `surgery_heads.py` 并提升到 `npu/` 顶层**：它是推荐 surgery ABC OM 生成链的一步
+  （README §3(d)）；`--do` 默认改 ABC（D 已弃用：TopK 1024 截断风险）。
+- `om_ref_test.py` 默认 `--om` 对齐 surgery ABC（原默认指向不存在的 static OM）；`verify_npu.sh`
+  重写到新路径（环境检查 + 核心文件语法 + init_patch + om_ref_demo 单帧 + om_ref_test --quick）。
+- README 重写为**单一路径**：依赖安装 → 数据准备 → OM 生成（ckpt→ONNX→手术 ABC→ATC 一条链）→
+  推理（demo/test 默认 OM，零参数），移除可选 OM、旧入口、多后端并列等分支路径。
+
 ### ✅ 移除 surgery ABCD OM：全量截断风险，推荐/默认统一切到 ABC（2026-09-29）
 
 - **根因**：D 手术把图内 TopK 4096→1024，而 config `NMS_PRE_MAXSIZE=4096`，且 TopK 作用在

@@ -4,11 +4,10 @@
 （R11/R40 bbox/bev/3d AP，与 tools/test.py 的 eval_one_epoch 同口径）。
 
 用法:
-    python npu/om_ref_test.py --om weights/pointpillar_fp16_static.om
-    python npu/om_ref_test.py --om weights/pointpillar_fp16_static.om --frames 5   # 快速抽验
-    python npu/om_ref_test.py --om weights/pointpillar_fp16_static.om --start 0 --end 1000
-    python npu/om_ref_test.py --om weights/pointpillar_fp16_static.om --save-preds preds_kitti
-    python npu/om_ref_test.py --om <om> --quick   # 只输出简化 TP/FP/FN + Recall/Precision
+    python npu/om_ref_test.py                      # 全量 val 评测（默认 OM：surgery ABC）
+    python npu/om_ref_test.py --frames 200         # 快速抽验 200 帧
+    python npu/om_ref_test.py --frames 50 --quick  # 只看简化计时（跳过官方评测）
+    python npu/om_ref_test.py --om <其他.om>       # 显式指定 OM
 
 说明:
     - 复用同一个 InferenceSession，静态/动态 shape OM 均支持（动态 OM 无 M 跳过）。
@@ -173,7 +172,7 @@ def _fast_image_shape(root_split_path, idx):
 def main():
     parser = argparse.ArgumentParser(description="Full KITTI val precision eval via OM")
     parser.add_argument("--config", default=str(ROOT / "data/config.yaml"))
-    parser.add_argument("--om", default=str(ROOT / "weights/pointpillar_fp16_static.om"))
+    parser.add_argument("--om", default=str(ROOT / "weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om"))
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--frames", type=int, default=0, help="0=全部; >0 只跑前 N 帧(抽验)")
     parser.add_argument("--start", type=int, default=0, help="从第 start 帧开始")

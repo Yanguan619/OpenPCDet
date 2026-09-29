@@ -1,16 +1,18 @@
 #!/bin/bash
-# NPU 适配验证脚本：环境检查 -> 补丁检查 -> 推理验证 -> 任务评测
-# 用法: bash npu/verify_npu.sh [--frames N] [--preds DIR]
+# NPU 适配验证脚本：环境检查 -> 补丁检查 -> 推理验证 -> 简化评测
+# 用法: bash npu/verify_npu.sh [--frames N] [--bin <demo.bin>]
+# 前提: 已按 npu/README.md 完成依赖安装（unum_ops + OPP）、OM 生成、KITTI 数据准备。
 
 set -e
 cd "$(dirname "$0")/.."
 
 FRAMES=5
-PREDS_DIR=/tmp/verify_preds
+BIN=data/kitti/training/velodyne/000008.bin
+OM=weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --frames) FRAMES="$2"; shift 2;;
-        --preds) PREDS_DIR="$2"; shift 2;;
+        --bin) BIN="$2"; shift 2;;
         *) echo "未知参数: $1"; exit 1;;
     esac
 done
@@ -29,8 +31,8 @@ else:
 PY
 
 echo
-echo "=== 2. 必需交付物存在性 / 语法检查 ==="
-for f in npu/debug/infer.py npu/debug/eval.py npu/npu_patch.py; do
+echo "=== 2. 核心文件存在性 / 语法检查 ==="
+for f in npu/npu_patch.py npu/om_ref_demo.py npu/om_ref_test.py npu/surgery_heads.py; do
     if [ ! -f "$f" ]; then
         echo "FAIL: $f 缺失"; exit 1
     fi
@@ -38,7 +40,7 @@ for f in npu/debug/infer.py npu/debug/eval.py npu/npu_patch.py; do
 done
 
 echo
-echo "=== 3. npu_patch.py 初始化入口可重复调用 ==="
+echo "=== 3. npu_patch 初始化（voxelize 应为 AscendC，无回退） ==="
 python - <<'PY'
 from npu.npu_patch import init_patch, get_device
 d1 = init_patch()
@@ -48,16 +50,20 @@ assert d1 == d2
 PY
 
 echo
-echo "=== 4. 推理验证: infer.py (frames=%d) ===" % "$FRAMES"
-rm -rf "$PREDS_DIR"
-python npu/debug/infer.py --device auto --frames "$FRAMES" --save-preds "$PREDS_DIR"
-N_FILES=$(ls "$PREDS_DIR" | wc -l)
-echo "OK  推理产出 $N_FILES 个预测文件"
-[ "$N_FILES" -gt 0 ] || { echo "FAIL: 无预测文件"; exit 1; }
+echo "=== 4. 单帧 demo 推理 ==="
+if [ ! -f "$BIN" ]; then
+    echo "SKIP: $BIN 不存在（先按 README 准备 KITTI 数据，或 --bin 指定 .bin 路径）"
+    exit 0
+fi
+if [ ! -f "$OM" ]; then
+    echo "SKIP: $OM 不存在（先按 README §生成 OM 完成 ckpt→ONNX→手术→ATC）"
+    exit 0
+fi
+python npu/om_ref_demo.py --data_path "$BIN"
 
 echo
-echo "=== 5. 任务评测: eval.py ==="
-python npu/debug/eval.py --preds "$PREDS_DIR" --frames "$FRAMES" | tail -40
+echo "=== 5. 简化评测（$FRAMES 帧，--quick） ==="
+python npu/om_ref_test.py --frames "$FRAMES" --quick
 
 echo
 echo "=== 完成 ==="

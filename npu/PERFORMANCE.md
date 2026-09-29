@@ -268,7 +268,7 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 - topk 图内（P2）：TopK(4096) 移入图内，NMS 只吃 4096 行，D2H 13MB→164KB → **3.5-4.0ms**（见 1/1.4）。
 - **09-29 重构后 0.60ms**（含 D2H 0.12）：numpy max/argmax 替代 torch.max（省 ~3.8ms）；torch sigmoid
   **保留**（numpy 版有 1ULP 差，为逐位一致不换）；NMS numba 标量化 0.57→0.21ms；D2H `copy=False`
-  host 缓冲直视。逐位一致性验证脚本 `npu/debug/verify_postproc_bitwise.py`。
+  host 缓冲直视。逐位一致性验证脚本 `npu/debug/verify_postproc_bitwise.py`（已随 debug/ 清理移除，见 git 历史）。
 
 ## 6. 精度
 
@@ -325,19 +325,18 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 # 单帧 demo（含前/后处理，000008 pad 到 9000）——注意 demo 无 FOV，体素化 122555 点
 python npu/om_ref_demo.py --om weights/pointpillar_base_fp32_static9000_v2.om
 
-# 单帧完整推理延迟（推荐 surgery ABC OM；09-29 集成态实测 22.5ms，30 iters 中位，ABCD 口径）
-python npu/om_ref_demo.py --data_path <bin 或目录> --om weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om
-
-# E2E 九段分段计时（demo 单帧，支持 BENCH_OM/BENCH_DEVICE/BENCH_ITERS 环境变量；
-# NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线做 A/B）
-BENCH_OM=weights/<om> BENCH_DEVICE=1 BENCH_ITERS=30 python npu/debug/perf_e2e_topk.py
+# 单帧完整推理延迟（默认即 surgery ABC OM；09-29 集成态实测 22.5ms，30 iters 中位，ABCD 口径）
+python npu/om_ref_demo.py --data_path <bin 或目录>
 
 # E2E 分段计时（200 帧，输出 前处理/推理/后处理 拆分 + 官方 AP）——全量管线口径（有 FOV）
-python npu/om_ref_test.py --om weights/pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om --frames 200
+python npu/om_ref_test.py --frames 200
 
 # 只看简化计时（跳过官方评测）
-python npu/om_ref_test.py --om weights/pointpillar_base_fp32_static9000_v2.om --frames 50 --quick
+python npu/om_ref_test.py --frames 50 --quick
 ```
+
+> E2E 九段计时脚本（BENCH_OM/BENCH_DEVICE/BENCH_ITERS 环境变量）已随 `npu/debug/` 清理移除，
+> 需要时从 git 历史取回（`852cd8b` 及之前）。
 
 > 注：`--frames N` 跑 val **前 N 帧**并在该子集上算 AP；静态 OM 对 M 超限的帧直接跳过
 > （跳过帧按零检测计入评测，会拉垮 AP）。本机 `weights/` 现仅存 topk 动态 OM，其余 OM 需在转换机准备。
