@@ -8,6 +8,16 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 移除 surgery ABCD OM：全量截断风险，推荐/默认统一切到 ABC（2026-09-29）
+
+- **根因**：D 手术把图内 TopK 4096→1024，而 config `NMS_PRE_MAXSIZE=4096`，且 TopK 作用在
+  score 阈值之前的 raw 分数上——密集帧 pre-NMS 候选 >1024 时在图内被**静默截断**；
+  bit-exact 仅 000008 单帧验证，3769 帧无保证。ABC 与 ABCD 前向仅差 0.05ms（9.65 vs 9.60ms），
+  且 TopK 保持 4096，语义与原 topk OM 完全一致——0.05ms 换语义零风险，全量禁用 D。
+- **改动**：删除 `weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`
+  （及 pcdet-om/om_out 的 ABCD OM/ONNX 产物）；`om_ref_demo` / `perf_e2e_topk` 默认 OM 切到
+  `..._surgery_abc_...om`；PERFORMANCE/README 推荐同步更新（ABCD 历史测量数据保留）。
+
 ### ✅ 三线性能攻坚 + 集成（2026-09-29，单帧 E2E ~67→22.5ms）
 
 并行三线（各自 worktree/分支），全部合入 master（`3ef09d9`），检测输出与基线逐帧一致（33 框）：

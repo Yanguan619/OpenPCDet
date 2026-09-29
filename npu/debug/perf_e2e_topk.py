@@ -3,7 +3,7 @@
 用法:
     BENCH_DEVICE=1 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
     BENCH_OM=/path/to/model.om BENCH_DEVICE=2 BENCH_ITERS=30 python3 npu/debug/perf_e2e_topk.py
-    # BENCH_OM 覆盖 OM 路径（默认 demo 赢家 surgery ABCD，前向 ~11ms；原 topk OM ~13ms）；静态 OM（expect_m>0）自动走 pad 分支
+    # BENCH_OM 覆盖 OM 路径（默认 surgery ABC，前向 ~9.7ms；原 topk OM ~13ms）；静态 OM（expect_m>0）自动走 pad 分支
     # NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线（回退 numpy 路径做 A/B）
 """
 import os
@@ -29,7 +29,7 @@ from npu.om_ref_demo import (DemoDataset, to_tensor, build_index_map, pad_to_sta
                              tensor_to_numpy, nms_topk_numpy, collate_batch_fast,
                              postprocess_topk, mkfeeds, coords_int32)
 
-OM = Path(os.environ.get('BENCH_OM', ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om'))
+OM = Path(os.environ.get('BENCH_OM', ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om'))
 BIN = ROOT / '000008.bin'
 CFG = ROOT / 'tools/cfgs/kitti_models/pointpillar.yaml'
 DEVICE = int(os.environ.get('BENCH_DEVICE', '0'))

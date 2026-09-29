@@ -185,9 +185,10 @@ python npu/om_ref_test.py --om weights/<你的 om>.om
 ## 性能结论（摘要）
 
 - **单帧 demo 完整推理**（无 FOV，体素化 122555 点）：**22.5 ms**（2026-09-29 集成态实测，device 1
-  稳态中位；推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`）。
+  稳态中位；推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om`——
+  TopK 4096 语义与原 topk OM 一致；ABCD 版因密集帧截断风险已移除，前向仅差 0.05ms）。
 - 演进：~93ms（numba 体素化）→ ~67ms（AscendC 体素化）→ **22.5ms**（体素化 561000 修复 + 设备常驻
-  管线 + head 图手术 ABCD + CPU 后处理重构）；检测输出与基线逐帧一致（33 框）。
+  管线 + head 图手术 + CPU 后处理重构）；检测输出与基线逐帧一致（33 框）。
 - **数据集全量口径**（有 FOV，200 帧）：63.3 ms/帧（2026-09-28 测；本轮各段优化尚未在全量口径复测）。
 - 基线 369ms（2026-09-22 全量）→ 63.3ms，累计 **5.8x**（全量口径）。
 - 当前瓶颈：OM 推理 ~11ms（backbone conv 占 44% + scatter 1.26ms）与体素化 kernel 6.24ms（标量排序墙）；

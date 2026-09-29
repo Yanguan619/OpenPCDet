@@ -120,7 +120,7 @@ E2E 最优见 1.4；base 版为 `pointpillar_base_fp16_dynamic18000_force_linux_
 > 各段收益合计 −33.8ms，与 67→22.5（−44.5）的差额 ~10.7ms 为测量口径差（09-28 各值为 est. +
 > device 0 高负载 avg10；本轮 device 1 同 OM 基线实测 forward 仅 11.3，旧值 22.8 高估 ~11ms）。
 > 精度红线：33 框（Car 12/Ped 14/Cyc 7）与基线逐帧一致；设备常驻 ON/OFF（A/B 22.5 vs 23.7ms，净赚
-> ~1.2ms）、nblk 7/8 框表均逐字节一致。推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
+> ~1.2ms）、nblk 7/8 框表均逐字节一致。推荐 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om`（TopK 4096 语义与原 topk OM 一致；ABCD 因截断风险已移除，见 §2 表注）。
 
 ### 1.4 topk 图内 OM（P2）全量管线口径验证（动态 18000，200 帧）
 
@@ -172,7 +172,8 @@ E2E 最优见 1.4；base 版为 `pointpillar_base_fp16_dynamic18000_force_linux_
 | `pointpillar_base_fp16_dynamic18000_force_linux_aarch64.om` | 动态 M=1~18000 | 21.3 ms | 全量 val base 推荐（动态，无 pad 浪费） |
 | `pointpillar_base_fp16_static18000_force.om` | 静态 M=18000 | 19.7 ms | 全量 val 兼容（18000 覆盖所有帧，但总有 pad 浪费） |
 | `pointpillar_base_fp16_dynamic18000_topk_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 4096） | 22.0 ms | **P2 topk 图内**，后处理 11.8→4ms，E2E 最优（1.4） |
-| `pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 1024） | **9.60 ms**（同设备对照）/ 10.97（集成态） | **09-29 head 图手术 ABCD**（head 1x1 合并/冗余 gather 消除/ConvTranspose→Conv1x1+DTS/TopK 4096→1024），输出逐框一致；当前 demo 推荐（§1.3/5.2） |
+| `pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om` | 动态 M=1~18000（图内 TopK 4096） | 9.65 ms（同设备对照） | **09-29 head 图手术 ABC（当前推荐，demo/bench 默认）**：A/B/C 同 ABCD 但不做 D，TopK 保持 4096，语义与原 topk OM 完全一致，全量评测无截断风险 |
+| ~~`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`~~ | 动态 M=1~18000（图内 TopK 1024） | 9.60 ms（同设备对照，仅 000008 单帧） | 09-29 head 图手术 ABCD：比 ABC 仅快 0.05ms，但 TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧 pre-NMS 候选可能被图内静默截断（bit-exact 仅单帧验证）→ **09-29 已移除文件，全量禁用** |
 
 ### 前向优化链（186ms → 24ms，7.8x）
 
@@ -251,7 +252,9 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
   DepthToSpace(4)（mode 须写 **'CRD'**，CANN 语义与 ONNX 规范相反，探针实测）；D) TopK 4096→1024。
   同设备对照（device 2）11.32→**9.60ms（−15%）**，输出逐框一致（坐标 0.000977 / score 0.000122）；
   集成态 10.97（device 1，含设备常驻 BaseTensor 的 GE 内部 D2D +1.4，host feeds 为 9.55）。
-  赢家 OM：`pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om`。
+  ~~赢家 OM：abcd 版~~ → **09-29 复核推翻**：D 的 TopK 1024 < NMS_PRE_MAXSIZE 4096，密集帧
+  pre-NMS 候选可能被图内静默截断（bit-exact 仅 000008 单帧验证），且仅比 ABC 快 0.05ms；
+  ABCD OM 文件已删除，**推荐/默认统一切到 ABC 版**（TopK 4096，语义与原 topk OM 完全一致）。
 - **msprof（基线 topk OM，device 2）**：AICPU 占比 ≈0；Conv 族合计 ~4.8ms / 10.8ms = **44%**
   （Conv2D 2598us + Conv2DTransposeD 1866us）；GatherV2 voxel→BEV scatter 1260us（**mte2 99.6% 单向
   bound**）；TransData ~800us。证伪留档：7 种 ATC 精度/融合开关组合均无增益；全量 ConvTranspose
@@ -291,12 +294,12 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 | ~~NMS 图内化~~ | 图内 sigmoid+TopK+NMS | **无收益且不可行** | ❌ 图内全链使前向 24→47ms，劣于 base 24 + CPU 后处理 16.5 = 40.5ms；且 **310P 的 NonMaxSuppression IoU 抑制失效**（返回全部 max_out=500、无抑制，487 Car 重复 vs CPU 正确 32）；**框数硬限制 ≤50000**（PointPillar 321408 anchors 超限）导致输出完全垃圾。后处理留 CPU 为最优。 |
 | AscendC 融合预处理算子（方案 A） | FOV+mask+voxelize 单 AscendC kernel | 前处理 42→~5-10ms | ✅ voxelize 已 kernel 化并启用（2.5x，见 5.1）；剩 FOV 未 kernel 化；暂缓 |
 | ~~体素化 561000 修复 + 设备常驻管线~~ | ThreadCtxGuard + numba 单遍 mask + BaseTensor 零拷贝 feeds | getitem 32→**10.0**、feeds 2.4→0.5 | ✅ 09-29（`27bcb48` + unum_ops `387bb9e`/`a8a101d`）；ON/OFF 框表逐字节一致（A/B 22.5 vs 23.7ms） |
-| ~~head 图手术 ABCD~~ | 1x1 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS / TopK 4096→1024 | forward 11.32→**9.60**（−15%） | ✅ 09-29（`8b1e6d8`），输出逐框一致；7 种 ATC 开关组合证伪无增益、全量 pixelshuffle 重写慢 8 倍 |
+| ~~head 图手术 ABCD~~ | 1x1 合并 / 冗余 gather 消除 / ConvTranspose→Conv1x1+DTS / TopK 4096→1024 | forward 11.32→**9.60**（−15%） | ✅ 09-29（`8b1e6d8`），输出逐框一致；7 种 ATC 开关组合证伪无增益、全量 pixelshuffle 重写慢 8 倍；**全量改用 ABC 变体**（D 截断风险，ABCD OM 已移除） |
 | ~~collate / 后处理重构~~ | 单帧 fast-path（双态）+ numpy max + numba NMS 标量化 | 5.2→**0.45**、4.0→**0.60** | ✅ 09-29（`5eccc9b`），逐位一致（verify_postproc_bitwise.py） |
 | AMCT int8 量化（backbone conv） | conv 占 forward 44%，量化是唯一大幅压缩手段 | forward **−1.5~2ms** | 待办：10ms 路径上收益最大的一项 |
 | 自定义 voxel→BEV scatter 算子 | GatherV2 mte2 单向 bound（99.6%），融合写 kernel ~50% 空间 | ~−0.6ms | 待办 |
 | 体素化 kernel 向量化重写 | 标量排序墙 6.24ms（bit-exact 契约，见 5.1） | kernel →~4.6ms | 待办：数值风险，独立迭代；先行小步（fill 携数据/S1+hist0 融合/桶批 scatter）可先得 −1.6ms |
-| ~~M≥18000 动态/静态 OM~~ | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force` / `fp16_dynamic18000_topk`）；09-29 起推荐 surgery ABCD 版 |
+| ~~M≥18000 动态/静态 OM~~ | 覆盖全量 val（54% 帧 M>9000） | 全量评测可用 | 动态已转（`fp16_dynamic18000_force` / `fp16_dynamic18000_topk`）；09-29 起推荐 surgery ABC 版 |
 | 跨帧流水线 | async D2H 与下帧预处理重叠 | 只提 FPS | 单帧延迟无益 |
 
 ### 性能收益预估
@@ -322,8 +325,8 @@ atc --model=weights/pointpillar_nms_base_v2_dynamic_topk.onnx --framework=5 \
 # 单帧 demo（含前/后处理，000008 pad 到 9000）——注意 demo 无 FOV，体素化 122555 点
 python npu/om_ref_demo.py --om weights/pointpillar_base_fp32_static9000_v2.om
 
-# 单帧完整推理延迟（推荐 surgery ABCD OM；09-29 集成态实测 22.5ms，30 iters 中位）
-python npu/om_ref_demo.py --data_path <bin 或目录> --om weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om
+# 单帧完整推理延迟（推荐 surgery ABC OM；09-29 集成态实测 22.5ms，30 iters 中位，ABCD 口径）
+python npu/om_ref_demo.py --data_path <bin 或目录> --om weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om
 
 # E2E 九段分段计时（demo 单帧，支持 BENCH_OM/BENCH_DEVICE/BENCH_ITERS 环境变量；
 # NPU_VOX_DEVICE_RESIDENT=0 可关闭设备常驻管线做 A/B）

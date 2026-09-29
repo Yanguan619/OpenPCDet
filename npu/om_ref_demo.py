@@ -589,7 +589,7 @@ def parse_config():
                         default=str(ROOT / 'data/kitti/training/velodyne/000008.bin'),
                         help='specify the point cloud data file or directory')
     parser.add_argument('--om', type=str,
-                        default=str(ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abcd_linux_aarch64.om'),
+                        default=str(ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om'),
                         help='specify the OM model')
     parser.add_argument('--ext', type=str, default='.bin',
                         help='specify the extension of your point cloud data file')
