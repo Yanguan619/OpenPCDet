@@ -35,7 +35,7 @@ NUM_ANCHORS = 321408
 class PPWrapper(nn.Module):
     """PointPillars 前向包装：4 输入 → batch_box_preds, batch_cls_preds（无后处理）。
 
-    模块级定义供 om_ref_test_pt 等脚本复用；export_base_onnx 内部实例化。
+    export_base_onnx 内部实例化。
     """
 
     def __init__(self, model):

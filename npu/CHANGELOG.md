@@ -8,6 +8,18 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 删除 om_ref_test_pt.py：PT 基线属 debug 产物（2026-09-30）
+
+- **背景**：精度已对齐（全量口径 Car moderate 与官方基线 -0.03，且历史上
+  preds_pt_full ≈ preds_fp32 相差 <0.1 已完成使命），该脚本是精度对齐阶段的
+  PyTorch 后端对照工具，主链路（om_ref_demo/om_ref_test/verify_npu.sh）无任何
+  调用方，属 debug 产物。需要 PT 对照时从 git 历史取回。
+- **连带清理**：README 交付清单移除该行；`export_onnx.PPWrapper` docstring 去掉
+  "供 om_ref_test_pt 等脚本复用"表述（此后仅 export_base_onnx 内部实例化）；
+  npu_patch 生产链路注释同步。09-29 条目"RC 上首次跑 PT 基线时留意"随之作废。
+- **验证**：全仓残留引用 grep 干净（CHANGELOG 历史条目与 CodeReview 归档除外）；
+  export_onnx/npu_patch `py_compile` 通过；`__pycache__` 残留 pyc 一并清除。
+
 ### ✅ npu 目录清理：死代码 / 过时引用 / hard_exit 兜底移除（2026-09-29）
 
 - **hard_exit 兜底移除**（`npu_patch.hard_exit` 及 `om_ref_demo`/`om_ref_test` 尾部调用）：

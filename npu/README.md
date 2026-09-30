@@ -143,7 +143,6 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
    └── npu/                            # NPU 推理交付目录
        ├── om_ref_demo.py              # 单帧推理 + 计时（主入口）
        ├── om_ref_test.py              # 全量数据集评测（内嵌官方 KITTI AP）
-       ├── om_ref_test_pt.py           # 全量推理（PyTorch 后端，精度对照用）
        ├── export_onnx.py              # ONNX 导出+Ascend 图改写+图手术一条链（无数据集依赖）
        ├── npu_patch.py                # 设备检测/算子适配统一补丁（体素化固定 AscendC）
        ├── verify_npu.sh               # 环境→补丁→推理→评测 串联验证

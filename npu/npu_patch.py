@@ -4,11 +4,12 @@
 集中处理：
 1. 设备检测（npu / cuda / cpu）
 2. torch_npu 初始化（关闭 jit_compile 以避免逐帧编译）
-3. anchors / tensor 的跨设备搬运
-4. voxelization 相关适配（build_index_map 等）
+3. spconv 别名 / AscendC 体素化 / numba mask / 设备常驻 collate 等 monkey patch
+4. CPU rotate IoU（KITTI 评测用）
+5. voxelization 共享工具（build_index_map，含 NPU 常驻 tensor 路径）
 
 用法:
-    from npu.npu_patch import init_patch, patch_rotate_iou, get_device, to_tensor, build_index_map
+    from npu.npu_patch import init_patch, patch_rotate_iou, get_device, build_index_map
     device = init_patch()
 """
 
@@ -527,51 +528,46 @@ def init_patch(jit_compile=False):
     return device
 
 
-def to_device(tensor, device):
-    """将 tensor 搬运到指定设备（npu/cuda/cpu）。"""
-    if device == "npu":
-        return tensor.npu()
-    if device == "cuda":
-        return tensor.cuda()
-    return tensor.cpu()
+def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
+    """构造 PointPillarScatter 的 Gather 索引表 (G,) int64（空位 = pad，默认 = M）。
 
+    唯一实现，被 om_ref_demo / om_ref_test / export_onnx 共用
+    （demo 侧 `from npu.om_ref_demo import build_index_map` 为本函数的转引）。
 
-def to_tensor(data_dict, device, keys=None):
-    """将 data_dict 中的 numpy 数组转为 tensor 并搬运到 device。
-
-    跳过非 ndarray 及 ['frame_id', 'metadata', 'calib'] 元数据字段。
-    """
-    for key, val in data_dict.items():
-        if not isinstance(val, np.ndarray):
-            continue
-        if key in ["frame_id", "metadata", "calib"]:
-            continue
-        data_dict[key] = to_device(torch.from_numpy(val), device)
-    return data_dict
-
-
-def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None):
-    """由 voxel_coords 构造 BEV index map（scatter 用）。
+    NPU 常驻 tensor 走纯 torch 路径（device 侧构造，省 D2H→numpy scatter→H2D
+    往返，实测 0.27ms vs numpy 路径含 host 往返）；整数算术与 numpy 路径
+    逐位一致（voxel 坐标唯一，无重复索引写入）。注意 CPU tensor 必须走 numpy
+    路径：本机 aarch64 的 torch CPU index_put_ 慢路径 ~9ms（numpy 仅 0.2ms）。
 
     Args:
-        voxel_coords: (M, 4) [batch, x, y, z]（或 [batch, z, y, x]）
+        voxel_coords: (M, 4) [batch, x, y, z]（或 [batch, z, y, x]）tensor / ndarray
         nx, ny, nz: 体素网格尺寸
         M: voxel 数（默认取 voxel_coords 行数）
+        pad: 空位填充值（默认 = M，静态 OM pad 行语义）
 
     Returns:
-        torch.LongTensor: 展平 BEV 网格 -> voxel 索引，空位为 M。
+        torch.LongTensor: 展平 BEV 网格 -> voxel 索引，空位为 pad。
     """
-    coords = voxel_coords.cpu().numpy()
+    if M is None:
+        M = voxel_coords.shape[0]
+    if isinstance(voxel_coords, torch.Tensor) and getattr(voxel_coords, 'is_npu', False):
+        coords = voxel_coords.to(torch.int64)
+        indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
+        G = nx * ny * nz
+        pad = M if pad is None else pad
+        index_map = torch.full((G,), pad, dtype=torch.int64, device=coords.device)
+        index_map[indices] = torch.arange(M, dtype=torch.int64, device=coords.device)
+        return index_map
+    coords = voxel_coords.numpy() if isinstance(voxel_coords, torch.Tensor) else voxel_coords
     indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
     G = nx * ny * nz
-    if M is None:
-        M = coords.shape[0]
-    index_map = np.full(G, M, dtype=np.int64)
+    pad = M if pad is None else pad
+    index_map = np.full(G, pad, dtype=np.int64)
     index_map[indices.astype(np.int64)] = np.arange(M, dtype=np.int64)
     return torch.from_numpy(index_map)
 
 
-# 生产链路（om_ref_demo/om_ref_test/om_ref_test_pt 等）只 import 本模块、不调 init_patch()，
+# 生产链路（om_ref_demo/om_ref_test 等）只 import 本模块、不调 init_patch()，
 # 故在此 import 时即：① alias spconv→unum_ops shim（否则顶层 spconv 与 unum_ops.spconv 是两份拷贝，
 # patch 打不到消费者用的类）；② 体素化固定路由 AscendC（唯一实现，无回退无开关，
 # unum_ops/OPP 为硬依赖，缺失 import 即报错）。

@@ -41,7 +41,10 @@ from aclruntime import InferenceSession
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import DatasetTemplate
 from pcdet.utils import common_utils
-NUM_ANCHORS = 321408  # 216 * 248 * 2(rot) * 3(class)
+
+# OM 推理共享 helper 的唯一实现在 npu_patch（含 NPU 常驻 tensor 路径与 pad 语义）；
+# 此处转引以维持 `from npu.om_ref_demo import build_index_map`（om_ref_test）。
+from npu.npu_patch import build_index_map
 
 try:
     import numba
