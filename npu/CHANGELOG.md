@@ -8,6 +8,38 @@
 
 ## TODO v1.3.0（规划中）：性能优化（精度 bit 一致红线）
 
+### ✅ 删除 npu/ops_native/：iou3d/NMS 后处理收敛到 unum_ops.cv + demo 逐段计时（2026-10-08）
+
+- **背景**：`ops_native/iou3d_nms_torch_native.py`（823 行）与 pip 包 `unum_ops.cv` 的
+  `boxes_iou_bev`/`topk_nms` 是数值逐位相同的同一套 numba 实现的两份拷贝，而 unum_ops
+  本就是硬依赖（spconv alias + AscendC 体素化均走它），仓内再养一份 iou3d 无意义。
+  09-29 条目"`ops_native/` 仅保留 iou3d"的口径自此作废。
+- **改动**：
+  - **删 `npu/ops_native/` 整目录**：demo `postprocess_topk` 的 NMS 从本地 `nms_topk_numpy`
+    切到 `unum_ops.cv.topk_nms`；`om_ref_test` 的评测 IoU（`boxes_iou_bev`）与 numba 预热
+    同步切换。
+  - **硬依赖化（删静默回退死分支）**：`npu_patch._alias_spconv` 去掉 ImportError return
+    （缺 unum_ops 直接 ImportError）；`om_ref_demo` 删 `_HAS_NUMBA` 守卫与 FOV `_mm3`
+    列式回退（npu_patch 顶层无条件 import numba，守卫本身即死分支）。
+  - **死代码**：删 `npu_patch._patch_collate_tensor_aware`——设备常驻输出的 collate 由
+    demo `collate_batch_fast` 单帧 fast-path 承担（全链路单帧，多帧+tensor 无调用方），
+    留注释交代去向。
+  - **demo 计时重构**：旧 `OM inference time` 为单发冷调用（`--num-iters` 是无人引用的
+    死参数，实测冷态 18.3ms vs 稳态 ~10.7ms 偏高 ~70%）；改为 `run_frame` 六段计时
+    （getitem/collate/idxmap/feeds/forward/postproc），`--perf-iters` 默认 30 遍取各段
+    中位（单发模式先丢一遍冷跑），`[perf]` 行输出 E2E 与六段中位，与 PERFORMANCE.md
+    §1.3 基线同口径；topk_nms 的 numba 预热移出首帧计时。
+  - **文档/格式化**：README 目录树移除 `ops_native/`；PERFORMANCE.md 计时口径说明同步；
+    npu_patch/om_ref_demo 全量 black（双引号/行宽，无逻辑变更）。
+- **验证**（精度 bit 一致红线）：demo 000008 上板与 HEAD（worktree 旧版）输出 **33 框
+  逐位一致**（class/xyz/dxdydz/r/score 全列 diff 为空）、退出码 0，forward 10.90ms 与
+  基线 10.97ms 持平；`boxes_iou_bev` 512×512 随机框+边界案例（重合/分离/半重叠/旋转 90°
+  等价）max diff=0；`_nms_incremental` 20 组随机（含重复框/并列分数）与 `topk_nms`
+  端到端 20 组随机（score_thresh/pre_max/post_max 分支全覆盖）均逐位一致；改动文件
+  `py_compile` 通过；`ops_native`/`nms_topk_numpy`/`_mm3`/`_nms_iou_matrix` 残留引用
+  grep 干净（CHANGELOG 历史条目除外）。本机缺 KITTI infos，`om_ref_test` 全量评测未
+  复跑（其 IoU 与 demo 共享 unum_ops.cv 路径，已由数值对比覆盖）。
+
 ### ✅ 删除 om_ref_test_pt.py：PT 基线属 debug 产物（2026-09-30）
 
 - **背景**：精度已对齐（全量口径 Car moderate 与官方基线 -0.03，且历史上

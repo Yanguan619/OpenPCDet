@@ -4,7 +4,7 @@
 集中处理：
 1. 设备检测（npu / cuda / cpu）
 2. torch_npu 初始化（关闭 jit_compile 以避免逐帧编译）
-3. spconv 别名 / AscendC 体素化 / numba mask / 设备常驻 collate 等 monkey patch
+3. spconv 别名 / AscendC 体素化 / numba mask 等 monkey patch
 4. CPU rotate IoU（KITTI 评测用）
 5. voxelization 共享工具（build_index_map，含 NPU 常驻 tensor 路径）
 
@@ -20,7 +20,9 @@ import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))  # unum_ops 一律走 pip 安装（editable）解析，不做相邻 checkout 的 sys.path 兜底
+sys.path.insert(
+    0, str(ROOT)
+)  # unum_ops 一律走 pip 安装（editable）解析，不做相邻 checkout 的 sys.path 兜底
 
 import numba
 import numpy as np
@@ -36,14 +38,13 @@ def _alias_spconv():
     注意：必须用强制赋值而非 setdefault——unum_ops 自身在导入时会经 sparse_modules 触发
     顶层 `import spconv`，产生与 unum_ops.spconv 同路径的**第二份拷贝**；setdefault 会因
     该拷贝已存在而静默失效，导致下游拿到的类与这里 patch 的不是同一个。
+
+    unum_ops 为硬依赖（同 _patch_voxelize_ascendc），缺失时直接 ImportError，不回退。
     """
-    try:
-        import unum_ops.spconv
-        import unum_ops.spconv.utils
-    except ImportError:
-        return
-    sys.modules['spconv'] = sys.modules['unum_ops.spconv']
-    sys.modules['spconv.utils'] = sys.modules['unum_ops.spconv.utils']
+    import unum_ops.spconv
+    import unum_ops.spconv.utils  # noqa: F401
+    sys.modules["spconv"] = sys.modules["unum_ops.spconv"]
+    sys.modules["spconv.utils"] = sys.modules["unum_ops.spconv.utils"]
 
 
 def _patch_voxelize_ascendc():
@@ -61,8 +62,8 @@ def _patch_voxelize_ascendc():
     if _VOXELIZE_PATCHED:
         return
     _VOXELIZE_PATCHED = True
-    from unum_ops.voxelization.voxelization_ascendc_v2 import voxelization
     from unum_ops.spconv.utils import VoxelGeneratorV2
+    from unum_ops.voxelization.voxelization_ascendc_v2 import voxelization
 
     def generate(self, points):
         p = torch.from_numpy(np.ascontiguousarray(points, dtype=np.float32)).npu()
@@ -79,26 +80,25 @@ def _patch_voxelize_ascendc():
             # D2H→numpy→H2D 往返。coords 的 (x,y,z)→(z,y,x) 换列在 device
             # 侧完成，值与 numpy 版逐位一致。
             return {
-                'voxels': out.voxels,
-                'coordinates': out.coords[:, [2, 1, 0]].contiguous(),
-                'num_points_per_voxel': out.num_points,
+                "voxels": out.voxels,
+                "coordinates": out.coords[:, [2, 1, 0]].contiguous(),
+                "num_points_per_voxel": out.num_points,
             }
         return {
-            'voxels': out.voxels.cpu().numpy(),
-            'coordinates': out.coords.cpu().numpy()[:, [2, 1, 0]],
-            'num_points_per_voxel': out.num_points.cpu().numpy(),
+            "voxels": out.voxels.cpu().numpy(),
+            "coordinates": out.coords.cpu().numpy()[:, [2, 1, 0]],
+            "num_points_per_voxel": out.num_points.cpu().numpy(),
         }
 
     VoxelGeneratorV2.generate = generate
-    print(f'[npu_patch] voxelize = AscendC NPU kernel（unum_ops.voxelization_ascendc_v2, '
-          f'device_resident={"on" if _VOX_DEVICE_RESIDENT else "off"}）', flush=True)
+
 
 _VOXELIZE_PATCHED = False
 
 # 设备常驻模式：voxelization 输出以 NPU tensor 直通 collate/index_map/feeds，
 # 消除 D2H→numpy→collate 拷贝→H2D 往返（省 ~4-5ms）。由调用脚本在 import 本模块
 # 前设置 NPU_VOX_DEVICE_RESIDENT=1 开启（默认关：其余脚本保持 numpy 契约不变）。
-_VOX_DEVICE_RESIDENT = os.environ.get('NPU_VOX_DEVICE_RESIDENT', '0') == '1'
+_VOX_DEVICE_RESIDENT = os.environ.get("NPU_VOX_DEVICE_RESIDENT", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -112,17 +112,16 @@ _VOX_DEVICE_RESIDENT = os.environ.get('NPU_VOX_DEVICE_RESIDENT', '0') == '1'
 # 原逻辑（demo 无 gt_boxes，训练路径不受影响）。NPU_NUMBA_MASK=0 关闭。
 # ---------------------------------------------------------------------------
 def _patch_mask_points_by_range():
-    if os.environ.get('NPU_NUMBA_MASK', '1') != '1':
+    if os.environ.get("NPU_NUMBA_MASK", "1") != "1":
         return
     try:
-        import numba
         from functools import partial
+
+        import numba
+
         from pcdet.datasets.processor import data_processor as dp_mod
         from pcdet.utils import box_utils, common_utils
     except Exception:
-        return
-    if getattr(dp_mod.DataProcessor.mask_points_and_boxes_outside_range,
-               '_unum_numba_mask', False):
         return
 
     @numba.njit(cache=True)
@@ -152,91 +151,23 @@ def _patch_mask_points_by_range():
     def _mask_and_boxes_outside_range(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.mask_points_and_boxes_outside_range, config=config)
-        if data_dict.get('points', None) is not None:
-            data_dict['points'] = _npy_mask_compact(
-                data_dict['points'], self.point_cloud_range)
-        if (data_dict.get('gt_boxes', None) is not None
-                and config.REMOVE_OUTSIDE_BOXES and self.training):
+        if data_dict.get("points", None) is not None:
+            data_dict["points"] = _npy_mask_compact(data_dict["points"], self.point_cloud_range)
+        if (
+            data_dict.get("gt_boxes", None) is not None
+            and config.REMOVE_OUTSIDE_BOXES
+            and self.training
+        ):
             mask = box_utils.mask_boxes_outside_range_numpy(
-                data_dict['gt_boxes'], self.point_cloud_range,
-                min_num_corners=config.get('min_num_corners', 1),
-                use_center_to_filter=config.get('USE_CENTER_TO_FILTER', True),
+                data_dict["gt_boxes"],
+                self.point_cloud_range,
+                min_num_corners=config.get("min_num_corners", 1),
+                use_center_to_filter=config.get("USE_CENTER_TO_FILTER", True),
             )
-            data_dict['gt_boxes'] = data_dict['gt_boxes'][mask]
+            data_dict["gt_boxes"] = data_dict["gt_boxes"][mask]
         return data_dict
 
-    _mask_and_boxes_outside_range._unum_numba_mask = True
     dp_mod.DataProcessor.mask_points_and_boxes_outside_range = _mask_and_boxes_outside_range
-
-
-# ---------------------------------------------------------------------------
-# 设备常驻模式的 collate_batch：torch.Tensor 走 torch.cat / F.pad（与 numpy 版
-# 逐位一致），numpy 值仍走原逻辑。仅覆盖 demo/推理链路的 key 集合，其余 key 无
-# tensor 时整批委托原实现。
-# ---------------------------------------------------------------------------
-def _patch_collate_tensor_aware():
-    if not _VOX_DEVICE_RESIDENT:
-        return
-    try:
-        from pcdet.datasets import DatasetTemplate
-    except Exception:
-        return
-    if getattr(DatasetTemplate.collate_batch, '_unum_tensor_aware', False):
-        return
-    _orig = DatasetTemplate.collate_batch
-
-    def _collate(batch_list, _unused=False):
-        has_tensor = any(isinstance(v, torch.Tensor)
-                         for s in batch_list for v in s.values())
-        if not has_tensor:
-            return _orig(batch_list, _unused)
-        from collections import defaultdict
-        data_dict = defaultdict(list)
-        for cur_sample in batch_list:
-            for key, val in cur_sample.items():
-                data_dict[key].append(val)
-        batch_size = len(batch_list)
-        ret = {}
-        batch_size_ratio = 1
-        for key, val in data_dict.items():
-            try:
-                if key in ['voxels', 'voxel_num_points']:
-                    if isinstance(val[0], list):
-                        batch_size_ratio = len(val[0])
-                        val = [i for item in val for i in item]
-                    if isinstance(val[0], torch.Tensor):
-                        ret[key] = torch.cat(val, dim=0)
-                    else:
-                        ret[key] = np.concatenate(val, axis=0)
-                elif key in ['points', 'voxel_coords']:
-                    coors = []
-                    if isinstance(val[0], list):
-                        val = [i for item in val for i in item]
-                    for i, coor in enumerate(val):
-                        if isinstance(coor, torch.Tensor):
-                            coors.append(torch.nn.functional.pad(
-                                coor, (1, 0), mode='constant', value=i))
-                        else:
-                            coors.append(np.pad(coor, ((0, 0), (1, 0)),
-                                                mode='constant', constant_values=i))
-                    if isinstance(val[0], torch.Tensor):
-                        ret[key] = torch.cat(coors, dim=0)
-                    else:
-                        ret[key] = np.concatenate(coors, axis=0)
-                elif key in ['calib']:
-                    ret[key] = val
-                elif isinstance(val[0], torch.Tensor):
-                    ret[key] = torch.stack(val, dim=0)
-                else:
-                    ret[key] = np.stack(val, axis=0)
-            except Exception:
-                print('Error in collate_batch: key=%s' % key)
-                raise TypeError
-        ret['batch_size'] = batch_size * batch_size_ratio
-        return ret
-
-    _collate._unum_tensor_aware = True
-    DatasetTemplate.collate_batch = staticmethod(_collate)
 
 
 _F32 = np.float32
@@ -251,8 +182,7 @@ _F32 = np.float32
 
 @numba.njit(nopython=True)
 def _cpu_trangle_area(a, b, c):
-    return ((a[0] - c[0]) * (b[1] - c[1]) - (a[1] - c[1]) *
-            (b[0] - c[0])) / _F32(2.0)
+    return ((a[0] - c[0]) * (b[1] - c[1]) - (a[1] - c[1]) * (b[0] - c[0])) / _F32(2.0)
 
 
 @numba.njit(nopython=True)
@@ -260,22 +190,24 @@ def _cpu_area(int_pts, num_of_inter):
     area_val = _F32(0.0)
     for i in range(num_of_inter - 2):
         area_val += abs(
-            _cpu_trangle_area(int_pts[:2], int_pts[2 * i + 2:2 * i + 4],
-                              int_pts[2 * i + 4:2 * i + 6]))
+            _cpu_trangle_area(
+                int_pts[:2], int_pts[2 * i + 2 : 2 * i + 4], int_pts[2 * i + 4 : 2 * i + 6]
+            )
+        )
     return area_val
 
 
 @numba.njit(nopython=True)
 def _cpu_sort_vertex_in_convex_polygon(int_pts, num_of_inter):
     if num_of_inter > 0:
-        center = np.zeros((2, ), dtype=_F32)
+        center = np.zeros((2,), dtype=_F32)
         for i in range(num_of_inter):
             center[0] += int_pts[2 * i]
             center[1] += int_pts[2 * i + 1]
         center[0] /= num_of_inter
         center[1] /= num_of_inter
-        v = np.zeros((2, ), dtype=_F32)
-        vs = np.zeros((16, ), dtype=_F32)
+        v = np.zeros((2,), dtype=_F32)
+        vs = np.zeros((16,), dtype=_F32)
         for i in range(num_of_inter):
             v[0] = int_pts[2 * i] - center[0]
             v[1] = int_pts[2 * i + 1] - center[1]
@@ -303,10 +235,10 @@ def _cpu_sort_vertex_in_convex_polygon(int_pts, num_of_inter):
 
 @numba.njit(nopython=True)
 def _cpu_line_segment_intersection(pts1, pts2, i, j, temp_pts):
-    A = np.zeros((2, ), dtype=_F32)
-    B = np.zeros((2, ), dtype=_F32)
-    C = np.zeros((2, ), dtype=_F32)
-    D = np.zeros((2, ), dtype=_F32)
+    A = np.zeros((2,), dtype=_F32)
+    B = np.zeros((2,), dtype=_F32)
+    C = np.zeros((2,), dtype=_F32)
+    D = np.zeros((2,), dtype=_F32)
 
     A[0] = pts1[2 * i]
     A[1] = pts1[2 * i + 1]
@@ -375,7 +307,7 @@ def _cpu_quadrilateral_intersection(pts1, pts2, int_pts):
             int_pts[num_of_inter * 2] = pts2[2 * i]
             int_pts[num_of_inter * 2 + 1] = pts2[2 * i + 1]
             num_of_inter += 1
-    temp_pts = np.zeros((2, ), dtype=_F32)
+    temp_pts = np.zeros((2,), dtype=_F32)
     for i in range(4):
         for j in range(4):
             has_pts = _cpu_line_segment_intersection(pts1, pts2, i, j, temp_pts)
@@ -397,8 +329,8 @@ def _cpu_rbbox_to_corners(corners, rbbox):
     center_y = rbbox[1]
     x_d = rbbox[2]
     y_d = rbbox[3]
-    corners_x = np.zeros((4, ), dtype=_F32)
-    corners_y = np.zeros((4, ), dtype=_F32)
+    corners_x = np.zeros((4,), dtype=_F32)
+    corners_y = np.zeros((4,), dtype=_F32)
     corners_x[0] = -x_d / 2
     corners_x[1] = -x_d / 2
     corners_x[2] = x_d / 2
@@ -414,15 +346,14 @@ def _cpu_rbbox_to_corners(corners, rbbox):
 
 @numba.njit(nopython=True)
 def _cpu_inter(rbbox1, rbbox2):
-    corners1 = np.zeros((8, ), dtype=_F32)
-    corners2 = np.zeros((8, ), dtype=_F32)
-    intersection_corners = np.zeros((16, ), dtype=_F32)
+    corners1 = np.zeros((8,), dtype=_F32)
+    corners2 = np.zeros((8,), dtype=_F32)
+    intersection_corners = np.zeros((16,), dtype=_F32)
 
     _cpu_rbbox_to_corners(corners1, rbbox1)
     _cpu_rbbox_to_corners(corners2, rbbox2)
 
-    num_intersection = _cpu_quadrilateral_intersection(corners1, corners2,
-                                                       intersection_corners)
+    num_intersection = _cpu_quadrilateral_intersection(corners1, corners2, intersection_corners)
     _cpu_sort_vertex_in_convex_polygon(intersection_corners, num_intersection)
 
     return _cpu_area(intersection_corners, num_intersection)
@@ -448,8 +379,8 @@ def _cpu_rotate_iou_loop(N, K, dev_boxes, dev_query_boxes, dev_iou, criterion):
     for tx in range(N):
         for i in range(K):
             dev_iou[tx * K + i] = _cpu_dev_rotate_iou_eval(
-                dev_query_boxes[i * 5:i * 5 + 5],
-                dev_boxes[tx * 5:tx * 5 + 5], criterion)
+                dev_query_boxes[i * 5 : i * 5 + 5], dev_boxes[tx * 5 : tx * 5 + 5], criterion
+            )
 
 
 def rotate_iou_gpu_eval(boxes, query_boxes, criterion=-1, device_id=0):
@@ -472,8 +403,9 @@ def rotate_iou_gpu_eval(boxes, query_boxes, criterion=-1, device_id=0):
     iou = np.zeros((N, K), dtype=np.float32)
     if N == 0 or K == 0:
         return iou
-    _cpu_rotate_iou_loop(N, K, boxes.reshape([-1]), query_boxes.reshape([-1]),
-                         iou.reshape([-1]), criterion)
+    _cpu_rotate_iou_loop(
+        N, K, boxes.reshape([-1]), query_boxes.reshape([-1]), iou.reshape([-1]), criterion
+    )
     return iou.astype(box_dtype)
 
 
@@ -550,7 +482,7 @@ def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
     """
     if M is None:
         M = voxel_coords.shape[0]
-    if isinstance(voxel_coords, torch.Tensor) and getattr(voxel_coords, 'is_npu', False):
+    if isinstance(voxel_coords, torch.Tensor) and getattr(voxel_coords, "is_npu", False):
         coords = voxel_coords.to(torch.int64)
         indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
         G = nx * ny * nz
@@ -571,11 +503,11 @@ def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
 # 故在此 import 时即：① alias spconv→unum_ops shim（否则顶层 spconv 与 unum_ops.spconv 是两份拷贝，
 # patch 打不到消费者用的类）；② 体素化固定路由 AscendC（唯一实现，无回退无开关，
 # unum_ops/OPP 为硬依赖，缺失 import 即报错）。
-# ③ numba 单遍 mask（值与原版逐位一致，NPU_NUMBA_MASK=0 关闭）；
-# ④ 设备常驻 collate（NPU_VOX_DEVICE_RESIDENT=1 时启用 tensor-aware collate_batch）。
+# ③ numba 单遍 mask（值与原版逐位一致，NPU_NUMBA_MASK=0 关闭）。
+# 设备常驻输出的 collate 由 demo 的 collate_batch_fast 单帧 fast-path 承担
+# （全链路单帧；多帧+tensor 场景当前无调用方，原 tensor-aware collate 补丁已删）。
 # ①②③ 必须在任意 DataProcessor/DemoDataset 构造之前生效（processor 以 partial
 # 捕获 bound method，晚 patch 不会命中已创建的实例）。
 _alias_spconv()
 _patch_voxelize_ascendc()
 _patch_mask_points_by_range()
-_patch_collate_tensor_aware()

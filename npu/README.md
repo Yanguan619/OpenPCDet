@@ -146,7 +146,6 @@ OpenPCDet 本体无需安装（推理脚本自行把仓库根加入 `sys.path`�
        ├── export_onnx.py              # ONNX 导出+Ascend 图改写+图手术一条链（无数据集依赖）
        ├── npu_patch.py                # 设备检测/算子适配统一补丁（体素化固定 AscendC）
        ├── verify_npu.sh               # 环境→补丁→推理→评测 串联验证
-       ├── ops_native/                 # 纯 numpy/numba 算子（iou3d NMS 等）
        └── README.md / PRECISION.md / PERFORMANCE.md / CHANGELOG.md
    ```
 

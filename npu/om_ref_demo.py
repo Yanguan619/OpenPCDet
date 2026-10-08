@@ -4,7 +4,7 @@
   - 同样用 DemoDataset 直接读 .bin/.npy 点云（--data_path 支持目录或单文件，--ext 指定后缀），
   - 同样 parse_config(--cfg_file) + 遍历样本 + collate_batch + 打印检测结果，
 唯一区别是前向由 aclruntime 加载的 OM 完成（代替 build_network + load_params_from_file），
-后处理（sigmoid + class_agnostic_nms）在 Python 侧完成（对应模型内建 post_processing）。
+后处理（sigmoid + topk_nms）在 host 侧完成（对应模型内建 post_processing）。
 
 用法:
     python npu/om_ref_demo.py \
@@ -16,7 +16,8 @@
 说明:
     - 静态 M OM 只接受固定 pillar 数的帧（如 000008 的 M=3941），
       其他帧会打印警告并跳过；用动态 OM（--input_shape 范围转出）可处理任意 M。
-    - 依赖: pip install aclruntime-0.0.3-cp311-cp311-linux_aarch64.whl
+    - 依赖: pip install aclruntime-0.0.3-cp311-cp311-linux_aarch64.whl；
+      unum_ops 为硬依赖（AscendC 体素化 + cv.topk_nms 后处理，安装见 npu/README.md §1）。
 """
 
 import argparse
@@ -30,72 +31,79 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 # 设备常驻管线（voxelization 输出保持 NPU tensor 直通 feeds）：默认开启，
 # NPU_VOX_DEVICE_RESIDENT=0 可回退 numpy 路径做 A/B。必须在 import npu_patch 前设置。
-os.environ.setdefault('NPU_VOX_DEVICE_RESIDENT', '1')
-import npu.npu_patch  # noqa: E402,F401  spconv alias + AscendC 体素化 + numba mask，须在 import pcdet 之前
-
+os.environ.setdefault("NPU_VOX_DEVICE_RESIDENT", "1")
 import aclruntime
 import numpy as np
 import torch
 from aclruntime import InferenceSession
+from unum_ops.cv import topk_nms
 
-from pcdet.config import cfg, cfg_from_yaml_file
-from pcdet.datasets import DatasetTemplate
-from pcdet.utils import common_utils
+import npu.npu_patch  # noqa: E402,F401  spconv alias + AscendC 体素化 + numba mask，须在 import pcdet 之前
 
 # OM 推理共享 helper 的唯一实现在 npu_patch（含 NPU 常驻 tensor 路径与 pad 语义）；
 # 此处转引以维持 `from npu.om_ref_demo import build_index_map`（om_ref_test）。
 from npu.npu_patch import build_index_map
+from pcdet.config import cfg, cfg_from_yaml_file
+from pcdet.datasets import DatasetTemplate
+from pcdet.utils import common_utils
 
-try:
-    import numba
-    _HAS_NUMBA = True
-except ImportError:
-    numba = None
-    _HAS_NUMBA = False
+# numba 为硬依赖（上面 import 的 npu_patch 顶层无条件 import numba），不做回退守卫。
+import numba
 
 
-if _HAS_NUMBA:
-    @numba.jit(nopython=True, cache=True)
-    def _fov_filter_numba(pts, a, p2, p2_c, p2_t32, img_w, img_h):
-        """FOV 投影 + 过滤单内核（逐点保持与 fov_filter_fused/_mm3 同乘加顺序）。
+@numba.jit(nopython=True, cache=True)
+def _fov_filter_numba(pts, a, p2, p2_c, p2_t32, img_w, img_h):
+    """FOV 投影 + 过滤单内核（逐点保持与 get_fov_flag 的列式 numpy 数学同乘加顺序）。
 
-        与 get_fov_flag 同数学：
-          pts_rect = pts @ A[:3] + A[3]   （A = V2C.T @ R0.T）
-          pts_2d   = pts_rect @ P2[:,:3].T + P2[:,3]
-          pts_img  = pts_2d[:,:2] / pts_rect[:,2] ；depth = pts_2d[:,2] - P2.T[3,2]
-        逐元素的乘加链顺序与列式 _mm3 完全一致，故 mask 与 numpy 版逐位相同。
-        """
-        n = pts.shape[0]
-        out = np.empty(n, dtype=np.bool_)
-        for i in range(n):
-            px = pts[i, 0]
-            py = pts[i, 1]
-            pz = pts[i, 2]
-            # _mm3(pts, a[:3]) + a[3]
-            xr = (px * a[0, 0] + py * a[1, 0] + pz * a[2, 0]) + a[3, 0]
-            yr = (px * a[0, 1] + py * a[1, 1] + pz * a[2, 1]) + a[3, 1]
-            zr = (px * a[0, 2] + py * a[1, 2] + pz * a[2, 2]) + a[3, 2]
-            # _mm3(pts_rect, P2[:,:3].T) + P2[:,3]
-            x2 = (xr * p2[0, 0] + yr * p2[1, 0] + zr * p2[2, 0]) + p2_c[0]
-            y2 = (xr * p2[0, 1] + yr * p2[1, 1] + zr * p2[2, 1]) + p2_c[1]
-            z2 = (xr * p2[0, 2] + yr * p2[1, 2] + zr * p2[2, 2]) + p2_c[2]
-            ui = x2 / zr
-            vi = y2 / zr
-            depth = z2 - p2_t32
-            out[i] = (ui >= 0.0) and (ui < img_w) and (vi >= 0.0) and (vi < img_h) and (depth >= 0.0)
-        return out
+    与 get_fov_flag 同数学：
+      pts_rect = pts @ A[:3] + A[3]   （A = V2C.T @ R0.T）
+      pts_2d   = pts_rect @ P2[:,:3].T + P2[:,3]
+      pts_img  = pts_2d[:,:2] / pts_rect[:,2] ；depth = pts_2d[:,2] - P2.T[3,2]
+    逐元素的乘加链顺序与列式 numpy 版完全一致，故 mask 与 numpy 版逐位相同。
+    """
+    n = pts.shape[0]
+    out = np.empty(n, dtype=np.bool_)
+    for i in range(n):
+        px = pts[i, 0]
+        py = pts[i, 1]
+        pz = pts[i, 2]
+        # pts @ a[:3] + a[3]
+        xr = (px * a[0, 0] + py * a[1, 0] + pz * a[2, 0]) + a[3, 0]
+        yr = (px * a[0, 1] + py * a[1, 1] + pz * a[2, 1]) + a[3, 1]
+        zr = (px * a[0, 2] + py * a[1, 2] + pz * a[2, 2]) + a[3, 2]
+        # pts_rect @ P2[:,:3].T + P2[:,3]
+        x2 = (xr * p2[0, 0] + yr * p2[1, 0] + zr * p2[2, 0]) + p2_c[0]
+        y2 = (xr * p2[0, 1] + yr * p2[1, 1] + zr * p2[2, 1]) + p2_c[1]
+        z2 = (xr * p2[0, 2] + yr * p2[1, 2] + zr * p2[2, 2]) + p2_c[2]
+        ui = x2 / zr
+        vi = y2 / zr
+        depth = z2 - p2_t32
+        out[i] = (
+            (ui >= 0.0) and (ui < img_w) and (vi >= 0.0) and (vi < img_h) and (depth >= 0.0)
+        )
+    return out
 
 
 class DemoDataset(DatasetTemplate):
     """与 tools/demo.py 的 DemoDataset 完全一致：读任意 .bin/.npy 点云做推理。"""
 
-    def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None, ext='.bin'):
+    def __init__(
+        self, dataset_cfg, class_names, training=True, root_path=None, logger=None, ext=".bin"
+    ):
         super().__init__(
-            dataset_cfg=dataset_cfg, class_names=class_names, training=training, root_path=root_path, logger=logger
+            dataset_cfg=dataset_cfg,
+            class_names=class_names,
+            training=training,
+            root_path=root_path,
+            logger=logger,
         )
         self.root_path = root_path
         self.ext = ext
-        data_file_list = glob.glob(str(root_path / f'*{self.ext}')) if self.root_path.is_dir() else [self.root_path]
+        data_file_list = (
+            glob.glob(str(root_path / f"*{self.ext}"))
+            if self.root_path.is_dir()
+            else [self.root_path]
+        )
 
         data_file_list.sort()
         self.sample_file_list = data_file_list
@@ -104,16 +112,16 @@ class DemoDataset(DatasetTemplate):
         return len(self.sample_file_list)
 
     def __getitem__(self, index):
-        if self.ext == '.bin':
+        if self.ext == ".bin":
             points = np.fromfile(self.sample_file_list[index], dtype=np.float32).reshape(-1, 4)
-        elif self.ext == '.npy':
+        elif self.ext == ".npy":
             points = np.load(self.sample_file_list[index])
         else:
             raise NotImplementedError
 
         input_dict = {
-            'points': points,
-            'frame_id': index,
+            "points": points,
+            "frame_id": index,
         }
 
         data_dict = self.prepare_data(data_dict=input_dict)
@@ -123,6 +131,7 @@ class DemoDataset(DatasetTemplate):
 # ============================================================
 # OM 推理 helpers（被 npu/om_ref_test.py 等复用，勿删）
 # ============================================================
+
 
 def to_tensor(x):
     """ndarray → CPU tensor；tensor 原样返回（设备常驻模式下为 NPU tensor，不再强制 .cpu()）。"""
@@ -134,7 +143,7 @@ def to_tensor(x):
 
 
 def _is_npu_tensor(x):
-    return isinstance(x, torch.Tensor) and getattr(x, 'is_npu', False)
+    return isinstance(x, torch.Tensor) and getattr(x, "is_npu", False)
 
 
 def collate_batch_fast(batch_list):
@@ -153,50 +162,37 @@ def collate_batch_fast(batch_list):
         dd = batch_list[0]
         if any(_is_npu_tensor(v) for v in dd.values()):
             # 设备常驻模式：voxels/coords/num_points 为 NPU tensor —— torch 单帧
-            # fast path（引用 + F.pad 补 batch 列，全 device 侧无 host 往返），
-            # 语义与 npu_patch 的 tensor-aware collate 一致（单帧 batch idx=0）。
+            # fast path（引用 + F.pad 补 batch 列，全 device 侧无 host 往返；
+            # 单帧 batch idx=0，语义与 numpy 版同格式）。
             ret = {}
             for key, val in dd.items():
-                if key in ('voxels', 'voxel_num_points', 'points'):
+                if key in ("voxels", "voxel_num_points", "points"):
                     ret[key] = val  # 单帧无 batch 维，直接引用（只读消费）
-                elif key == 'voxel_coords':
-                    ret[key] = torch.nn.functional.pad(
-                        val, (1, 0), mode='constant', value=0)
+                elif key == "voxel_coords":
+                    ret[key] = torch.nn.functional.pad(val, (1, 0), mode="constant", value=0)
                 else:
                     ret[key] = np.stack([val], axis=0)
-            ret['batch_size'] = 1
+            ret["batch_size"] = 1
             return ret
         ret = {}
         for key, val in dd.items():
-            if key in ('voxels', 'voxel_num_points'):
+            if key in ("voxels", "voxel_num_points"):
                 ret[key] = val  # 单帧无 batch 维，直接引用（只读消费）
-            elif key == 'voxel_coords':
+            elif key == "voxel_coords":
                 out = np.zeros((val.shape[0], val.shape[1] + 1), dtype=val.dtype)
                 out[:, 1:] = val
                 ret[key] = out
-            elif key == 'points':
+            elif key == "points":
                 ret[key] = val  # 不补 batch 列，见 docstring
             else:
                 ret[key] = np.stack([val], axis=0)
-        ret['batch_size'] = 1
+        ret["batch_size"] = 1
         return ret
     return DatasetTemplate.collate_batch(batch_list)
 
 
-def _mm3(pts, m):
-    """pts(N,3) @ m(3,3)：列式逐元素（与 np.dot 同乘加顺序，仅 ~1 点/帧 浮点边界翻转）。
-
-    这台机器 numpy(openblas64 单线程) 对 (N,3)@(3,3) 走标量路径 ~81ms/次；
-    逐元素约 5ms。FOV 是预处理过滤，1 点边界翻转对 AP 无影响（AP 门禁验证）。
-    """
-    x = pts[:, 0] * m[0, 0] + pts[:, 1] * m[1, 0] + pts[:, 2] * m[2, 0]
-    y = pts[:, 0] * m[0, 1] + pts[:, 1] * m[1, 1] + pts[:, 2] * m[2, 1]
-    z = pts[:, 0] * m[0, 2] + pts[:, 1] * m[1, 2] + pts[:, 2] * m[2, 2]
-    return np.stack([x, y, z], axis=1)
-
-
 def fov_filter_fused(points, calib, img_shape):
-    """FOV 过滤（numba 单内核，与 get_fov_flag 同乘加顺序；无 numba 时回退 _mm3 列式路径）。
+    """FOV 过滤（numba 单内核，与 get_fov_flag 同乘加顺序）。
 
     与 calib.lidar_to_rect + get_fov_flag 同数学（乘加顺序一致）：
       A = V2C.T @ R0.T (4,3)；pts_rect = points @ A[:3] + A[3]
@@ -206,48 +202,15 @@ def fov_filter_fused(points, calib, img_shape):
     """
     pts = points[:, :3]
     a = calib.V2C.T @ calib.R0.T  # (4, 3)
-    if _HAS_NUMBA:
-        return _fov_filter_numba(
-            np.ascontiguousarray(pts, dtype=np.float32),
-            np.ascontiguousarray(a, dtype=np.float32),
-            np.ascontiguousarray(calib.P2[:, :3].T, dtype=np.float32),
-            np.ascontiguousarray(calib.P2[:, 3], dtype=np.float32),
-            calib.P2.T[3, 2],
-            int(img_shape[1]), int(img_shape[0]),
-        )
-    pts_rect = _mm3(pts, a[:3]) + a[3]  # (N, 3)
-    pts_2d = _mm3(pts_rect, calib.P2[:, :3].T) + calib.P2[:, 3]  # (N, 3)
-    pts_img = pts_2d[:, :2] / pts_rect[:, 2:3]
-    pts_rect_depth = pts_2d[:, 2] - calib.P2.T[3, 2]
-    val_flag_1 = np.logical_and(pts_img[:, 0] >= 0, pts_img[:, 0] < img_shape[1])
-    val_flag_2 = np.logical_and(pts_img[:, 1] >= 0, pts_img[:, 1] < img_shape[0])
-    val_flag_merge = np.logical_and(val_flag_1, val_flag_2)
-    return np.logical_and(val_flag_merge, pts_rect_depth >= 0)
-
-
-def build_index_map(voxel_coords, nx=432, ny=496, nz=1, M=None, pad=None):
-    """构造 PointPillarScatter 的 Gather 索引表 (G,) int64（pad 行号 = pad，默认 = M）。
-
-    NPU 常驻 tensor 走纯 torch 路径（device 侧构造，省 D2H→numpy scatter→H2D
-    往返，实测 0.27ms vs numpy 路径含 host 往返）；整数算术与 numpy 路程
-    逐位一致（voxel 坐标唯一，无重复索引写入）。注意 CPU tensor 必须走 numpy
-    路径：本机 aarch64 的 torch CPU index_put_ 慢路径 ~9ms（numpy 仅 0.2ms）。
-    """
-    if isinstance(voxel_coords, torch.Tensor) and getattr(voxel_coords, 'is_npu', False):
-        coords = voxel_coords.to(torch.int64)
-        indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
-        G = nx * ny * nz
-        pad = M if pad is None else pad
-        index_map = torch.full((G,), pad, dtype=torch.int64, device=coords.device)
-        index_map[indices] = torch.arange(M, dtype=torch.int64, device=coords.device)
-        return index_map
-    coords = voxel_coords.numpy() if isinstance(voxel_coords, torch.Tensor) else voxel_coords
-    indices = coords[:, 1] + coords[:, 2] * nx + coords[:, 3]
-    G = nx * ny * nz
-    pad = M if pad is None else pad
-    index_map = np.full(G, pad, dtype=np.int64)
-    index_map[indices.astype(np.int64)] = np.arange(M, dtype=np.int64)
-    return torch.from_numpy(index_map)
+    return _fov_filter_numba(
+        np.ascontiguousarray(pts, dtype=np.float32),
+        np.ascontiguousarray(a, dtype=np.float32),
+        np.ascontiguousarray(calib.P2[:, :3].T, dtype=np.float32),
+        np.ascontiguousarray(calib.P2[:, 3], dtype=np.float32),
+        calib.P2.T[3, 2],
+        int(img_shape[1]),
+        int(img_shape[0]),
+    )
 
 
 # 模块级 pad 缓冲复用（按 (m_target, *shape) 缓存，避免每帧 torch.cat + new_zeros 重分配）。
@@ -270,18 +233,27 @@ def pad_to_static_m(voxels, voxel_num_points, voxel_coords, m_target):
     if M > m_target:
         raise ValueError("M=%d > 静态 OM M=%d，超出范围" % (M, m_target))
     if M < m_target:
-        key = (m_target, *tuple(voxels.shape[1:]), voxel_coords.shape[1],
-               str(voxels.device) if isinstance(voxels, torch.Tensor) else 'cpu')
+        key = (
+            m_target,
+            *tuple(voxels.shape[1:]),
+            voxel_coords.shape[1],
+            str(voxels.device) if isinstance(voxels, torch.Tensor) else "cpu",
+        )
         bufs = _PAD_BUFS.get(key)
         if bufs is None:
             if isinstance(voxels, torch.Tensor):
                 bufs = (
-                    torch.zeros((m_target, *voxels.shape[1:]), dtype=voxels.dtype,
-                                device=voxels.device),
-                    torch.zeros((m_target,), dtype=voxel_num_points.dtype,
-                                device=voxel_num_points.device),
-                    torch.zeros((m_target, voxel_coords.shape[1]), dtype=voxel_coords.dtype,
-                                device=voxel_coords.device),
+                    torch.zeros(
+                        (m_target, *voxels.shape[1:]), dtype=voxels.dtype, device=voxels.device
+                    ),
+                    torch.zeros(
+                        (m_target,), dtype=voxel_num_points.dtype, device=voxel_num_points.device
+                    ),
+                    torch.zeros(
+                        (m_target, voxel_coords.shape[1]),
+                        dtype=voxel_coords.dtype,
+                        device=voxel_coords.device,
+                    ),
                 )
             else:
                 bufs = (
@@ -323,8 +295,10 @@ def mkfeeds(voxels, voxel_num_points, voxel_coords, bev_index_map, device):
     这些等待本来就要发生，只是显式化。
     """
     fs = []
-    dev_resident = any(isinstance(t, torch.Tensor) and getattr(t, 'is_npu', False)
-                       for t in (voxels, voxel_num_points, voxel_coords, bev_index_map))
+    dev_resident = any(
+        isinstance(t, torch.Tensor) and getattr(t, "is_npu", False)
+        for t in (voxels, voxel_num_points, voxel_coords, bev_index_map)
+    )
     if dev_resident:
         torch.npu.synchronize()
     for t in (voxels, voxel_num_points, voxel_coords, bev_index_map):
@@ -349,69 +323,19 @@ def tensor_to_numpy(t, dtype, copy=True):
     return arr.copy() if copy else arr
 
 
-def nms_topk_numpy(boxes, scores, score_thresh, nms_config):
-    """numpy 版 top-K 预筛 + 增量贪心旋转 NMS（与 class_agnostic_nms 同结果，避开 torch 小算子开销）。
-
-    NPU 310P 的 aicpu 对 topk/nonzero 等不稳定（见 model_nms_utils.py 注释），因此 top-K
-    筛选放到 host 侧 numpy 完成：
-      - score_thresh 掩码（>=，与 class_agnostic_nms 一致）
-      - 超出 NMS_PRE_MAXSIZE 时用 np.argpartition（O(N) 选 top-K，与 torch.topk 同集合，
-        并列分数次序差异允许）+ np.argsort 对 top-K 排序
-    NMS 直接复用 npu/ops_native/iou3d_nms_torch_native.py 的 numba 增量贪心 _nms_incremental
-    （要求输入已按 score 降序）；numba 不可用时回退 class_agnostic_nms。
-
-    Args:
-        boxes: (N, 7) float32 numpy，anchor 回归框（原始顺序）
-        scores: (N,) torch CPU 或 numpy，sigmoid 后单类分数
-        score_thresh: float 或 None
-        nms_config: NMS_PRE_MAXSIZE / NMS_POST_MAXSIZE / NMS_THRESH
-    Returns:
-        sel_idx: numpy int64，原始下标（score 降序）
-        sel_scores: numpy float32，对应分数
-    """
-    pre_max = int(getattr(nms_config, "NMS_PRE_MAXSIZE", 4096))
-    post_max = int(getattr(nms_config, "NMS_POST_MAXSIZE", 500))
-    thresh = float(getattr(nms_config, "NMS_THRESH", 0.01))
-    snp = scores.numpy() if hasattr(scores, "numpy") else np.asarray(scores)
-    if score_thresh is not None:
-        keep = np.nonzero(snp >= score_thresh)[0]
-    else:
-        keep = np.arange(snp.shape[0])
-    if keep.size > pre_max:
-        part = np.argpartition(snp[keep], keep.size - pre_max)
-        keep = keep[part[keep.size - pre_max:]]
-    order = np.argsort(-snp[keep])
-    keep = keep[order]
-    try:
-        from npu.ops_native.iou3d_nms_torch_native import _nms_incremental
-    except ImportError:
-        from pcdet.models.model_utils import model_nms_utils
-        selected, sub_scores = model_nms_utils.class_agnostic_nms(
-            box_scores=torch.from_numpy(snp[keep]),
-            box_preds=torch.from_numpy(boxes[keep]),
-            nms_config=nms_config,
-            score_thresh=None,
-        )
-        orig = keep[selected.numpy()]
-        return orig, sub_scores.numpy()
-    boxes_nms = np.ascontiguousarray(boxes[keep][:, :7])
-    kept = _nms_incremental(boxes_nms, thresh)[:post_max]
-    orig = keep[kept]
-    return orig, snp[orig]
-
-
 def postprocess_topk(om_box, om_cls, score_thresh, nms_config):
-    """OM topk 输出的 host 后处理（numpy max/argmax + torch sigmoid + numpy 增量 NMS）。
+    """OM topk 输出的 host 后处理（numpy max/argmax + torch sigmoid + topk_nms）。
 
-    与 torch 版（torch.max + sigmoid + nms_topk_numpy）**逐位一致**：
+    与 torch 版（torch.max + sigmoid + class_agnostic_nms）**逐位一致**：
       - numpy .max/.argmax 与 torch.max 的值/下标一致（已验证）
       - sigmoid 保留 torch（numpy 1/(1+exp(-x)) 与 torch.sigmoid 有 1ULP 差异，不能替换）
+      - NMS 用 unum_ops.cv.topk_nms（numba 增量贪心，与 class_agnostic_nms 同结果）
     省掉 torch.max 在 (4096,3) 小张量上的调度开销（~3.8ms -> ~0.05ms）。
 
     Args:
         om_box: (1, N, 7) float32 numpy（可为 aclruntime host 视图）
         om_cls: (1, N, 3) float32 numpy
-        score_thresh / nms_config: 同 nms_topk_numpy
+        score_thresh / nms_config: 同 unum_ops.cv.topk_nms
     Returns:
         boxes: (K, 7) float32 numpy
         labels: (K,) int64 numpy（1-indexed class id）
@@ -422,7 +346,7 @@ def postprocess_topk(om_box, om_cls, score_thresh, nms_config):
     cls_max = c0.max(axis=-1)
     label = c0.argmax(axis=-1) + 1
     scores = torch.sigmoid(torch.from_numpy(cls_max))
-    selected, sel_scores = nms_topk_numpy(b, scores, score_thresh, nms_config)
+    selected, sel_scores = topk_nms(b, scores, score_thresh, nms_config)
     return b[selected], label[selected], sel_scores
 
 
@@ -467,7 +391,7 @@ def boxes_iou_bev(boxes_a, boxes_b):
     boxes_a/b: (N, 7) [x, y, z, dx, dy, dz, heading]
     返回: (N_a, N_b)
     """
-    from npu.ops_native.iou3d_nms_torch_native import boxes_iou_bev
+    from unum_ops.cv import boxes_iou_bev
 
     if len(boxes_a) == 0 or len(boxes_b) == 0:
         return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
@@ -583,31 +507,53 @@ def evaluate_against_labels(boxes, labels, scores, gt_objs, class_names, iou_thr
 # 与 tools/demo.py 同构的 parse_config / main
 # ============================================================
 
+
 def parse_config():
-    parser = argparse.ArgumentParser(description='arg parser')
-    parser.add_argument('--cfg_file', type=str,
-                        default=str(ROOT / 'tools/cfgs/kitti_models/pointpillar.yaml'),
-                        help='specify the config for demo')
-    parser.add_argument('--data_path', type=str,
-                        default=str(ROOT / 'data/kitti/training/velodyne/000008.bin'),
-                        help='specify the point cloud data file or directory')
-    parser.add_argument('--om', type=str,
-                        default=str(ROOT / 'weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om'),
-                        help='specify the OM model')
-    parser.add_argument('--ext', type=str, default='.bin',
-                        help='specify the extension of your point cloud data file')
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--num-iters', type=int, default=10, help='OM 测速迭代次数')
-    parser.add_argument('--score-thresh', type=float, default=None)
-    parser.add_argument('--iou-thresh', type=float, default=0.5, help='与 label 匹配的 IoU 阈值')
-    parser.add_argument('--label', default=None, help='KITTI label 文件路径（默认自动推断）')
+    parser = argparse.ArgumentParser(description="arg parser")
+    parser.add_argument(
+        "--cfg_file",
+        type=str,
+        default=str(ROOT / "tools/cfgs/kitti_models/pointpillar.yaml"),
+        help="specify the config for demo",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=str(ROOT / "data/kitti/training/velodyne/000008.bin"),
+        help="specify the point cloud data file or directory",
+    )
+    parser.add_argument(
+        "--om",
+        type=str,
+        default=str(
+            ROOT / "weights/pointpillar_base_fp16_dynamic18000_topk_surgery_abc_linux_aarch64.om"
+        ),
+        help="specify the OM model",
+    )
+    parser.add_argument(
+        "--ext",
+        type=str,
+        default=".bin",
+        help="specify the extension of your point cloud data file",
+    )
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--score-thresh", type=float, default=None)
+    parser.add_argument("--iou-thresh", type=float, default=0.5, help="与 label 匹配的 IoU 阈值")
+    parser.add_argument(
+        "--perf-iters",
+        type=int,
+        default=30,
+        help="每帧性能计时执行遍数（各段取中位；默认 30 与 PERFORMANCE.md §1.3 同口径，"
+        "1=预热后单发，大批量冒烟可调小）",
+    )
+    parser.add_argument("--label", default=None, help="KITTI label 文件路径（默认自动推断）")
 
     args = parser.parse_args()
 
     # kitti_models 配置的 _BASE_CONFIG_ 相对 tools/ 解析，与 demo.py 一致
     cfg_path = Path(args.cfg_file)
-    if 'tools/cfgs' in str(cfg_path) and os.getcwd() != str(ROOT / 'tools'):
-        os.chdir(str(ROOT / 'tools'))
+    if "tools/cfgs" in str(cfg_path) and os.getcwd() != str(ROOT / "tools"):
+        os.chdir(str(ROOT / "tools"))
 
     cfg_from_yaml_file(args.cfg_file, cfg)
 
@@ -627,58 +573,78 @@ def resolve_path(p):
 def main():
     args, cfg = parse_config()
     logger = common_utils.create_logger()
-    logger.info('-----------------Quick Demo of OpenPCDet (OM)-------------------------')
+    logger.info("-----------------Quick Demo of OpenPCDet (OM)-------------------------")
     # 必修：demo/bench 此前从不调用 torch.npu.set_device，patched generate() 的
     # .npu() 走默认 device 0，与 session 的 args.device 错位（跨设备访问/错设备占用）。
-    if getattr(torch, 'npu', None) is not None and torch.npu.is_available():
+    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
         torch.npu.set_device(args.device)
     demo_dataset = DemoDataset(
-        dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES, training=False,
-        root_path=resolve_path(args.data_path), ext=args.ext, logger=logger
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        training=False,
+        root_path=resolve_path(args.data_path),
+        ext=args.ext,
+        logger=logger,
     )
-    logger.info(f'Total number of samples: \t{len(demo_dataset)}')
+    logger.info(f"Total number of samples: \t{len(demo_dataset)}")
 
     # 构建 OM session（代替 demo 里的 build_network + load_params_from_file）
-    session = InferenceSession(str(resolve_path(args.om)), args.device, aclruntime.session_options())
+    session = InferenceSession(
+        str(resolve_path(args.om)), args.device, aclruntime.session_options()
+    )
     out_names = [d.name for d in session.get_outputs()]
     expect_m = session.get_inputs()[0].shape[0]
     base_mode = len(out_names) == 2  # base OM 输出 box+cls；否则为内嵌 NMS 的 OM
 
     nms_config = cfg.MODEL.POST_PROCESSING.NMS_CONFIG
     score_thresh = (
-        args.score_thresh if args.score_thresh is not None
+        args.score_thresh
+        if args.score_thresh is not None
         else cfg.MODEL.POST_PROCESSING.SCORE_THRESH
     )
 
-    # numba 预热：旋转 NMS 首次初始化 ~1.5s，移出计时区间
+    # numba 预热：topk_nms 旋转 NMS 首次 JIT ~1.5s，移出首帧
     try:
-        from npu.ops_native.iou3d_nms_torch_native import _nms_iou_matrix, _nms_incremental
-        _nms_iou_matrix(np.zeros((2, 7), dtype=np.float32))
-        _nms_incremental(np.zeros((2, 7), dtype=np.float32), 0.01)
+        topk_nms(
+            np.zeros((2, 7), dtype=np.float32),
+            np.array([0.9, 0.8], dtype=np.float32),
+            0.1,
+            nms_config,
+        )
     except Exception:
         pass
 
-    for idx, data_dict in enumerate(demo_dataset):
-        logger.info(f'Visualized sample index: \t{idx + 1}')
-        frame_id = Path(demo_dataset.sample_file_list[idx]).stem
+    def run_frame(idx, warm_om=True):
+        """单帧完整流水线：getitem → collate/to_tensor → pad/index_map → feeds → forward → postproc。
+
+        返回 (boxes, labels, scores, stage_ms)。stage_ms 为六段耗时(ms)，口径与
+        PERFORMANCE.md §1.3 对齐。warm_om=False 时不做 OM 预热执行（多遍取中位时
+        首遍冷启动由中位吸收，省一遍执行）。M 超静态 OM 上限返回 None。
+        """
+        t0 = time.perf_counter()
+        data_dict = demo_dataset[idx]  # getitem：读 bin + processors（AscendC 体素化）
+        t1 = time.perf_counter()
         data_dict = collate_batch_fast([data_dict])
 
-        voxels = to_tensor(data_dict['voxels'])
-        voxel_num_points = to_tensor(data_dict['voxel_num_points'])
-        voxel_coords = to_tensor(coords_int32(data_dict['voxel_coords']))
+        voxels = to_tensor(data_dict["voxels"])
+        voxel_num_points = to_tensor(data_dict["voxel_num_points"])
+        voxel_coords = to_tensor(coords_int32(data_dict["voxel_coords"]))
+        t2 = time.perf_counter()
         M = voxels.shape[0]
         if expect_m is not None and expect_m > 0:
             # 静态 shape OM：M < 固定值时 pad，M 超限则跳过
             if M > expect_m:
                 logger.warning(
-                    f'frame {frame_id}: M={M} 超过静态 OM M={expect_m}，跳过（请用动态 OM 或更大的静态 OM）'
+                    f"frame {Path(demo_dataset.sample_file_list[idx]).stem}: M={M} "
+                    f"超过静态 OM M={expect_m}，跳过（请用动态 OM 或更大的静态 OM）"
                 )
-                continue
+                return None
             voxels, voxel_num_points, voxel_coords, bev_index_map = pad_to_static_m(
                 voxels, voxel_num_points, voxel_coords, expect_m
             )
         else:
             bev_index_map = build_index_map(voxel_coords, M=M)
+        t3 = time.perf_counter()
 
         feeds = mkfeeds(voxels, voxel_num_points, voxel_coords, bev_index_map, args.device)
         if expect_m is not None and expect_m <= 0:
@@ -695,46 +661,105 @@ def main():
                     n *= max(d, 1)
                 out_size.append(n * 4 * 4)  # 每元素 4B * 4 倍余量
             session.set_custom_outsize(out_size)
+        t4 = time.perf_counter()
 
-        time_start = time.time()
+        # OM 预热：首次 aclmdlExecute 含内核装载/workspace 分配等一次性开销
+        # （实测冷 17-20ms vs 稳态 10.7ms），单发计时前先跑一次不计时的同 shape 执行
+        if warm_om:
+            session.run(out_names, feeds)
+            t4w = time.perf_counter()
+        else:
+            t4w = t4
         out = session.run(out_names, feeds)
-        print('OM inference time: {:.4f}s'.format(time.time() - time_start))
+        t5 = time.perf_counter()
 
         if base_mode:
             om_box = tensor_to_numpy(out[0], np.float32, copy=False).reshape(1, -1, 7)
             om_cls = tensor_to_numpy(out[1], np.float32, copy=False).reshape(1, -1, 3)
-            # numpy max/argmax + torch sigmoid + numpy 增量 NMS（与 torch 版逐位一致）
+            # numpy max/argmax + torch sigmoid + topk_nms（与 torch 版逐位一致）
             boxes, labels, scores = postprocess_topk(om_box, om_cls, score_thresh, nms_config)
         else:
             # 内嵌 NMS 的 OM：输出 nms_final_boxes/scores/labels/count
             boxes = tensor_to_numpy(out[0], np.float32).reshape(-1, 7)
             scores = tensor_to_numpy(out[1], np.float32)
             labels = tensor_to_numpy(out[2], np.int64) + 1
-            n_count = tensor_to_numpy(out[3], np.int64).reshape(-1)[0] if len(out) >= 4 else len(boxes)
+            n_count = (
+                tensor_to_numpy(out[3], np.int64).reshape(-1)[0] if len(out) >= 4 else len(boxes)
+            )
             boxes, scores, labels = boxes[:n_count], scores[:n_count], labels[:n_count]
 
-        print('\n%s 检测结果 (%d 个框):' % (frame_id, len(boxes)))
-        print('  %-10s %8s %8s %8s %6s %6s %6s %8s %8s'
-              % ('class', 'x', 'y', 'z', 'dx', 'dy', 'dz', 'r', 'score'))
+        t6 = time.perf_counter()
+        st = {
+            "getitem": (t1 - t0) * 1e3,
+            "collate": (t2 - t1) * 1e3,
+            "idxmap": (t3 - t2) * 1e3,
+            "feeds": (t4 - t3) * 1e3,
+            "forward": (t5 - t4w) * 1e3,
+            "postproc": (t6 - t5) * 1e3,
+        }
+        return boxes, labels, scores, st
+
+    for idx in range(len(demo_dataset)):
+        logger.info(f"Visualized sample index: \t{idx + 1}")
+        frame_id = Path(demo_dataset.sample_file_list[idx]).stem
+        n_perf = max(1, args.perf_iters)
+        if n_perf == 1:
+            # 单发模式：先冷跑一遍吸收一次性开销（numba 装载 / AscendC 算子首次加载 /
+            # NPU allocator 首分配，实测冷态 E2E ~270ms vs 稳态 ~22.5ms），结果丢弃
+            run_frame(idx)
+        # 多遍取各段中位：整链路有 ~8-10 遍的时钟爬坡（DVFS，25.3→22.8ms 才进稳态），
+        # 采样窗太短会落在衰减带；默认 30 遍与 PERFORMANCE.md §1.3 基线同口径
+        rets = []
+        for _ in range(n_perf):
+            r = run_frame(idx, warm_om=(n_perf == 1))
+            if r is None:
+                break
+            rets.append(r)
+        if not rets:
+            continue
+        boxes, labels, scores, _ = rets[0]
+        med = {k: sorted(r[3][k] for r in rets)[len(rets) // 2] for k in rets[0][3]}
+        print(
+            "[perf] E2E {e:.2f}ms (n={n} 中位) | getitem(读bin+体素化) {g:.2f} | "
+            "collate→tensor {c:.2f} | pad/index_map {im:.2f} | feeds(含set_dym) {f:.2f} | "
+            "forward {fw:.2f} | postproc(含D2H) {p:.2f}".format(
+                n=len(rets),
+                e=sum(med.values()),
+                g=med["getitem"],
+                c=med["collate"],
+                im=med["idxmap"],
+                f=med["feeds"],
+                fw=med["forward"],
+                p=med["postproc"],
+            )
+        )
+
+        print("\n%s 检测结果 (%d 个框):" % (frame_id, len(boxes)))
+        print(
+            "  %-10s %8s %8s %8s %6s %6s %6s %8s %8s"
+            % ("class", "x", "y", "z", "dx", "dy", "dz", "r", "score")
+        )
         class_names = cfg.CLASS_NAMES
         for b, l, s in zip(boxes, labels, scores):
-            print('  %-10s %8.2f %8.2f %8.2f %6.2f %6.2f %6.2f %8.3f %8.3f'
-                  % (class_names[int(l) - 1], b[0], b[1], b[2], b[3], b[4], b[5], b[6], s))
+            print(
+                "  %-10s %8.2f %8.2f %8.2f %6.2f %6.2f %6.2f %8.3f %8.3f"
+                % (class_names[int(l) - 1], b[0], b[1], b[2], b[3], b[4], b[5], b[6], s)
+            )
 
         # Label 对比（可选）
         label_path = args.label
         if label_path is None:
-            auto = ROOT / 'data' / 'kitti' / 'training' / 'label_2' / f'{frame_id}.txt'
+            auto = ROOT / "data" / "kitti" / "training" / "label_2" / f"{frame_id}.txt"
             if auto.exists():
                 label_path = str(auto)
         if label_path and Path(label_path).exists():
             gt_objs = load_kitti_labels(label_path)
             evaluate_against_labels(boxes, labels, scores, gt_objs, class_names, args.iou_thresh)
         else:
-            print('\n(未找到 label 文件，跳过对比。可用 --label 指定)')
+            print("\n(未找到 label 文件，跳过对比。可用 --label 指定)")
 
-    logger.info('Demo done.')
+    logger.info("Demo done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

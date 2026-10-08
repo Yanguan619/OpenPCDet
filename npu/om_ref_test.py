@@ -47,7 +47,6 @@ from npu.om_ref_demo import (
     pad_to_static_m,
     fov_filter_fused,
     tensor_to_numpy,
-    nms_topk_numpy,
     load_kitti_labels,
     collate_batch_fast,
     coords_int32,
@@ -55,7 +54,6 @@ from npu.om_ref_demo import (
     postprocess_topk,
 )
 
-NUM_ANCHORS = 321408
 ID2NAME = {1: "Car", 2: "Pedestrian", 3: "Cyclist"}
 CLASS_NAMES = ["Car", "Pedestrian", "Cyclist"]
 
@@ -118,7 +116,7 @@ def run_official_eval(preds_by_frame, dataset, sample_ids, class_names):
 
 def match_one_frame(boxes, labels, scores, gt_objs, iou_thresh):
     """单帧匹配，返回 class_id -> (tp, fp, fn) 与 每类 GT/检测 数量。"""
-    from npu.ops_native.iou3d_nms_torch_native import boxes_iou_bev
+    from unum_ops.cv import boxes_iou_bev
 
     gt_by, det_by = {}, {}
     for obj in gt_objs:
@@ -228,10 +226,16 @@ def main():
             out_size.append(n * 4 * 4)  # 每元素 4B * 4 倍余量
         session.set_custom_outsize(out_size)
     try:
-        from npu.ops_native.iou3d_nms_torch_native import _nms_iou_matrix, _nms_incremental
+        # topk_nms 的 numba 旋转 NMS 预热（首次 JIT ~1.5s，移出计时区间；
+        # nms_config 传 None 走默认 pre/post/thresh）
+        from unum_ops.cv import topk_nms
 
-        _nms_iou_matrix(np.zeros((2, 7), dtype=np.float32))
-        _nms_incremental(np.zeros((2, 7), dtype=np.float32), 0.01)  # numba 预热
+        topk_nms(
+            np.zeros((2, 7), dtype=np.float32),
+            np.array([0.9, 0.8], dtype=np.float32),
+            0.1,
+            None,
+        )
     except Exception:
         pass
     try:
@@ -263,7 +267,6 @@ def main():
     t0 = time.perf_counter()
 
     for i, fid in enumerate(sample_ids):
-        t_frame = time.perf_counter()
         # ---------------- 前处理 ----------------
         t_a = time.perf_counter()
         points = np.fromfile(velodyne_dir / ("%s.bin" % fid), dtype=np.float32).reshape(-1, 4)
